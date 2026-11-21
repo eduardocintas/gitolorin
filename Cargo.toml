@@ -1,0 +1,41 @@
+[package]
+name = "gitolorin"
+version = "0.1.0"
+edition = "2021"
+description = "Local Git Bastion, Credential Broker & Biometric Approval Queue for AI Coding Agents"
+license = "MIT"
+authors = ["edu"]
+
+[[bin]]
+name = "gitolorin"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "=0.7.5", features = ["json"] }
+tokio = { version = "=1.38.0", features = ["rt-multi-thread", "macros", "net", "process", "fs", "io-util", "sync", "time", "signal"] }
+serde = { version = "=1.0.203", features = ["derive"] }
+serde_json = "=1.0.117"
+clap = { version = "=4.4.18", features = ["derive"] }
+aes-gcm = "=0.10.3"
+argon2 = "=0.5.2"
+base64ct = "=1.6.0"
+password-hash = "=0.5.0"
+rand = "=0.8.5"
+zeroize = { version = "=1.7.0", default-features = false, features = ["alloc"] }
+sha2 = "=0.10.8"
+hmac = "=0.12.1"
+hex = "=0.4.3"
+base64 = "=0.21.7"
+chrono = { version = "=0.4.34", default-features = false, features = ["clock", "std", "serde"] }
+dirs = "=5.0.1"
+anyhow = "=1.0.80"
+hashbrown = "=0.14.5"
+indexmap = "=2.2.6"
+backtrace = "=0.3.71"
+socket2 = "=0.5.7"
+sync_wrapper = "=1.0.1"
+hyper-util = "=0.1.5"
+hyper = "=1.3.1"
+http = "=1.1.0"
+http-body-util = "=0.1.1"
+bytes = "=1.6.1"

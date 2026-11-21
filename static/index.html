@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>gitOlorin 🧙‍♂️ — Git Bastion & Biometric Approval Queue</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Header -->
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-logo">🧙‍♂️</span>
+        <div>
+          <h1>gitOlorin <span class="badge-ver">v0.1.0</span></h1>
+          <p class="subtitle">Local Git Bastion, Credential Broker &amp; Biometric Approval Queue for AI Agents</p>
+        </div>
+      </div>
+      <div class="status-pills">
+        <div id="pill-proxy" class="pill pill-ok">Proxy: 127.0.0.1:9418</div>
+        <div id="pill-vault" class="pill pill-warn">Bóveda: Sin configurar</div>
+        <div id="pill-vcs" class="pill pill-neutral">VCS: jj / git</div>
+      </div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <nav class="tabs">
+      <button class="tab-btn active" data-tab="queue">
+        📋 Cola de Aprobación <span id="badge-queue-count" class="tab-count">0</span>
+      </button>
+      <button class="tab-btn" data-tab="repos">
+        📦 Repositorios &amp; Crear Repo <span id="badge-repos-count" class="tab-count">0</span>
+      </button>
+      <button class="tab-btn" data-tab="vault">
+        🔐 Bóveda Biométrica &amp; Llaves
+      </button>
+      <button class="tab-btn" data-tab="audit">
+        🛡️ Auditoría ("You Shall Not Pass!")
+      </button>
+    </nav>
+
+    <!-- TAB 1: COLA DE APROBACIÓN EN LOTE -->
+    <main id="tab-queue" class="tab-panel active">
+      <section class="panel-header-card">
+        <div>
+          <h2>Cola Asíncrona de MRs, Creación de Repos y Acciones Protegidas</h2>
+          <p>Los agentes trabajan sin esperarte contra el Staging Local y ramas secundarias. Revisa los pendientes, marca los listos y aprueba todo el lote con <strong>1 sola Huella o PIN</strong>.</p>
+        </div>
+        <div class="batch-actions">
+          <button id="btn-approve-selected" class="btn btn-primary" onclick="openUnlockModal(false)">
+            指纹 Aprobar Marcados (<span id="lbl-ready-count">0</span>)
+          </button>
+          <button id="btn-approve-all" class="btn btn-accent" onclick="openUnlockModal(true)">
+            ⚡ Aprobar Todos con Huella/PIN
+          </button>
+        </div>
+      </section>
+
+      <div id="queue-list" class="cards-list">
+        <div class="empty-state">Cargando cola de pendientes...</div>
+      </div>
+    </main>
+
+    <!-- TAB 2: REPOSITORIOS & CREACIÓN -->
+    <main id="tab-repos" class="tab-panel">
+      <div class="grid-2">
+        <section class="card">
+          <h3>✨ Crear / Vincular Repositorio Protegido</h3>
+          <p class="muted">Configura el proxy local, genera token aislado para este único repo, inicializa Jujutsu (`jj`) o Git Worktrees e inyecta las reglas en <code>AGENTS.md</code>.</p>
+          <form id="form-init-repo" onsubmit="handleInitRepo(event)">
+            <div class="form-group">
+              <label>Nombre del Repositorio</label>
+              <input type="text" id="inp-repo-name" placeholder="ej. mi-nuevo-proyecto" required />
+            </div>
+            <div class="form-group">
+              <label>Directorio Local (Workspace)</label>
+              <input type="text" id="inp-repo-path" placeholder="/home/edu/git/pub/mi-nuevo-proyecto" />
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Flujo para Agentes (`AGENTS.md`)</label>
+                <select id="sel-repo-vcs">
+                  <option value="jj">Jujutsu (jj --colocate) [Recomendado Agentes]</option>
+                  <option value="worktree">Git Worktrees (Subagentes paralelos)</option>
+                  <option value="git">Git Clásico (Ramas feat/*)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Visibilidad en GitHub</label>
+                <select id="sel-repo-priv">
+                  <option value="true">🔒 Privado</option>
+                  <option value="false">🌐 Público (git/pub)</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Modo de Creación</label>
+              <select id="sel-repo-unlock">
+                <option value="agent_queue">⏳ Modo Staging Local Instantáneo (Encolar creación en GitHub)</option>
+                <option value="os_bio">指纹 Interactivo: Desbloquear con Huella del Sistema y crear en GitHub ya</option>
+                <option value="pin">🔑 Interactivo: Desbloquear con PIN de Bóveda y crear en GitHub ya</option>
+              </select>
+            </div>
+            <div id="grp-repo-pin" class="form-group hidden">
+              <label>PIN de Bóveda Admin</label>
+              <input type="password" id="inp-repo-pin" placeholder="Tu PIN de bóveda" />
+            </div>
+            <button type="submit" class="btn btn-primary full-w">🚀 Inicializar Repositorio con gitOlorin</button>
+          </form>
+          <div id="init-repo-feedback" class="feedback-box hidden"></div>
+        </section>
+
+        <section class="card">
+          <h3>📦 Repositorios Gobernados por gitOlorin</h3>
+          <div id="repos-list" class="repos-container">
+            <div class="empty-state">No hay repositorios registrados aún.</div>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <!-- TAB 3: BÓVEDA BIOMÉTRICA & LLAVES -->
+    <main id="tab-vault" class="tab-panel">
+      <div class="grid-2">
+        <section class="card">
+          <h3>🔐 Configurar Bóveda de Doble Credencial (AES-256-GCM + Argon2id)</h3>
+          <p class="muted">
+            Tu <strong>Admin Token</strong> se guarda encriptado en disco y se limpia de la RAM (<code>ZeroizeOnDrop</code>) inmediatamente después de cada aprobación en lote. Los agentes jamás tienen acceso a él.
+          </p>
+          <form id="form-vault-setup" onsubmit="handleVaultSetup(event)">
+            <div class="form-group">
+              <label>Usuario u Organización de GitHub</label>
+              <input type="text" id="inp-gh-user" placeholder="ej. edu" required />
+            </div>
+            <div class="form-group">
+              <label>Credencial 1 (Alta): Admin Token (Crear repos y mergear a <code>main</code>)</label>
+              <input type="password" id="inp-admin-pat" placeholder="ghp_... o github_pat_... (o 'demo_local' para pruebas offline)" required />
+              <small>Solo se desencripta en RAM por 2 segundos cuando pones tu Huella o PIN.</small>
+            </div>
+            <div class="form-group">
+              <label>Credencial 2 (Baja - Opcional): Worker Token (Solo push a ramas <code>feat/*</code>)</label>
+              <input type="password" id="inp-worker-pat" placeholder="Token limitado (el proxy bloquea main, force-push y delete)" />
+              <small>Usado automáticamente por el proxy cuando un agente hace fast-forward a ramas secundarias.</small>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>PIN / Passphrase de la Bóveda</label>
+                <input type="password" id="inp-vault-pin" placeholder="Mínimo 4 caracteres" required />
+              </div>
+              <div class="form-group">
+                <label>VCS por Defecto en <code>AGENTS.md</code></label>
+                <select id="sel-default-vcs">
+                  <option value="jj">Jujutsu (jj)</option>
+                  <option value="worktree">Git Worktree</option>
+                  <option value="git">Git</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-group checkbox-row">
+              <input type="checkbox" id="chk-os-bio" checked />
+              <label for="chk-os-bio">Habilitar Desbloqueo por Huella / Biometría del Sistema Operativo (Linux fprintd/Polkit, macOS TouchID, Windows Hello)</label>
+            </div>
+            <div class="form-group">
+              <button type="button" class="btn btn-secondary" onclick="registerWebAuthnPasskey()">
+                🔑 Registrar Llave / Huella WebAuthn del Navegador (Opcional)
+              </button>
+              <span id="lbl-webauthn-status" class="muted-inline"></span>
+            </div>
+            <button type="submit" class="btn btn-primary full-w">🛡️ Encriptar y Sellar Bóveda Admin</button>
+          </form>
+          <div id="vault-feedback" class="feedback-box hidden"></div>
+        </section>
+
+        <section class="card">
+          <h3>🧰 Estado del Entorno y Herramientas</h3>
+          <div id="env-status-box" class="status-details"></div>
+        </section>
+      </div>
+    </main>
+
+    <!-- TAB 4: AUDITORÍA -->
+    <main id="tab-audit" class="tab-panel">
+      <section class="card">
+        <h3>🛡️ Registro de Auditoría e Intercepciones del Proxy</h3>
+        <div id="audit-list" class="audit-table-wrap"></div>
+      </section>
+    </main>
+  </div>
+
+  <!-- MODAL: INSPECTOR DE DIFF -->
+  <div id="modal-diff" class="modal-backdrop hidden">
+    <div class="modal-card modal-large">
+      <div class="modal-header">
+        <h3 id="diff-modal-title">Inspección de Cambios (Diff)</h3>
+        <button class="btn-close" onclick="closeDiffModal()">✕</button>
+      </div>
+      <pre id="diff-modal-content" class="diff-viewer"></pre>
+    </div>
+  </div>
+
+  <!-- MODAL: DESBLOQUEO BIOMÉTRICO / PIN PARA APROBAR LOTE -->
+  <div id="modal-unlock" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>🧙‍♂️ Autorizar Lote en Bóveda Admin</h3>
+        <button class="btn-close" onclick="closeUnlockModal()">✕</button>
+      </div>
+      <p id="unlock-modal-desc" class="muted">
+        Desbloquea temporalmente la bóveda en RAM para ejecutar las operaciones aprobadas (crear repositorios pendientes en GitHub y fusionar MRs a <code>main</code>).
+      </p>
+      <div class="unlock-methods">
+        <button class="btn btn-accent full-w" onclick="submitBatchApproval('os_bio')">
+          指纹 Usar Huella del Sistema (fprintd / Polkit / TouchID / WinHello)
+        </button>
+        <div class="divider"><span>o desbloquear con PIN de Bóveda</span></div>
+        <div class="form-group">
+          <input type="password" id="inp-batch-pin" placeholder="Ingresa tu PIN de bóveda..." />
+        </div>
+        <button class="btn btn-primary full-w" onclick="submitBatchApproval('pin')">
+          🔓 Desbloquear con PIN y Ejecutar Lote
+        </button>
+      </div>
+      <div id="unlock-feedback" class="feedback-box hidden"></div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
