@@ -31,12 +31,16 @@ pub async fn initialize_managed_repository(
     base_dir: &Path,
     store: &StateStore,
     repo_name: &str,
+    display_name: &str,
+    template_id: &str,
+    license: &str,
     owner: &str,
     workspace_dir: &Path,
     private: bool,
     vcs_mode: &str,
     proxy_port: u16,
     admin_secret: Option<&AdminSecret>,
+    local_only: bool,
 ) -> Result<InitRepoResult> {
     let clean_name = repo_name.trim();
     if clean_name.is_empty()
@@ -153,6 +157,16 @@ pub async fn initialize_managed_repository(
         }
     }
     inject_agents_md(workspace_dir, clean_name, vcs_mode, &clean_proxy_url)?;
+    let _ = crate::templates::apply_template(
+        base_dir,
+        template_id,
+        workspace_dir,
+        clean_name,
+        display_name,
+        owner,
+        license,
+    );
+    crate::templates::write_license_file(workspace_dir, license, owner)?;
 
     // 5. Create initial commit on `main` if the repo has no commits yet, and push it to bare staging with admin override
     let has_head = Command::new("git")
@@ -164,7 +178,7 @@ pub async fn initialize_managed_repository(
 
     if !has_head {
         let _ = Command::new("git")
-            .args(["add", "AGENTS.md"])
+            .args(["add", "-A"])
             .current_dir(workspace_dir)
             .status();
         let _ = Command::new("git")
@@ -202,8 +216,14 @@ pub async fn initialize_managed_repository(
     let mode;
     let message;
 
+    let effective_desc = if display_name.trim().is_empty() {
+        "Managed & protected by gitOlorin Bastion".to_string()
+    } else {
+        display_name.trim().to_string()
+    };
+
     if let Some(secret) = admin_secret {
-        let gh_url = create_github_repo_api(secret, clean_name, private).await?;
+        let gh_url = create_github_repo_api(secret, clean_name, &effective_desc, private).await?;
         sync_bare_branch_to_github(
             &bare_path,
             &secret.github_username,
@@ -225,33 +245,86 @@ pub async fn initialize_managed_repository(
             true,
             &message,
         );
+    } else if local_only || existing_repo.as_ref().map(|r| r.github_synced).unwrap_or(false) {
+        if let Some(ref prev) = existing_repo {
+            github_synced = prev.github_synced;
+            github_url = prev.github_url.clone();
+        }
+        mode = if github_synced {
+            "local_reinit_synced".to_string()
+        } else {
+            "local_only".to_string()
+        };
+        message = if github_synced {
+            format!(
+                "✅ Repositorio '{}' re-inicializado en local (preservando vínculo existente en GitHub).",
+                clean_name
+            )
+        } else {
+            format!(
+                "✅ Repositorio '{}' inicializado en modo local (--local-only) sin encolar creación en GitHub.",
+                clean_name
+            )
+        };
+        store.add_audit(
+            clean_name,
+            "agent",
+            "repo_init_local",
+            true,
+            &message,
+        );
     } else {
         mode = "local_staging_queued".to_string();
-        let diff_sum = compute_bare_diff_summary(&bare_path, "refs/heads/main", "refs/heads/main")
-            .unwrap_or_else(|_| "Repositorio nuevo inicializado en staging local.".to_string());
-        let q_item = store.enqueue_item(
-            QueueItemKind::CreateRepo,
-            clean_name.to_string(),
-            format!("Crear repositorio '{}' en GitHub y sincronizar", clean_name),
-            format!(
-                "Solicitado en {} (Privado: {}, VCS: {}). El agente ya puede trabajar y hacer push contra el staging local sin esperarte.",
-                workspace_dir.display(),
+        let existing_pending_id = store
+            .snapshot()
+            .queue
+            .into_iter()
+            .find(|q| {
+                q.repo_name == clean_name
+                    && q.kind == QueueItemKind::CreateRepo
+                    && matches!(
+                        q.status,
+                        QueueItemStatus::Pending | QueueItemStatus::ApprovedForBatch
+                    )
+            })
+            .map(|q| q.id);
+
+        if let Some(existing_id) = existing_pending_id {
+            queued_item_id = Some(existing_id);
+            message = format!(
+                "⏳ Repositorio '{}' actualizado en Staging Local ({}). Ya existe solicitud #{} pendiente en cola para crear en GitHub.",
+                clean_name, clean_proxy_url, existing_id
+            );
+        } else {
+            let diff_sum =
+                compute_bare_diff_summary(&bare_path, "refs/heads/main", "refs/heads/main")
+                    .unwrap_or_else(|_| {
+                        "Repositorio nuevo inicializado en staging local.".to_string()
+                    });
+            let q_item = store.enqueue_item(
+                QueueItemKind::CreateRepo,
+                clean_name.to_string(),
+                format!("Crear repositorio '{}' en GitHub y sincronizar", clean_name),
+                format!(
+                    "Solicitado en {} (Privado: {}, VCS: {}). El agente ya puede trabajar y hacer push contra el staging local sin esperarte.",
+                    workspace_dir.display(),
+                    private,
+                    vcs_mode
+                ),
+                "main".to_string(),
+                "main".to_string(),
+                crate::inspector::ZERO_SHA.to_string(),
+                "HEAD".to_string(),
                 private,
-                vcs_mode
-            ),
-            "main".to_string(),
-            "main".to_string(),
-            crate::inspector::ZERO_SHA.to_string(),
-            "HEAD".to_string(),
-            private,
-            vcs_mode.to_string(),
-            diff_sum,
-        )?;
-        queued_item_id = Some(q_item.id);
-        message = format!(
-            "⏳ Repositorio '{}' listo en Staging Local ({}). El agente ya puede hacer commits y push. Pendiente #{} en cola para crear en GitHub con tu Huella/PIN.",
-            clean_name, clean_proxy_url, q_item.id
-        );
+                vcs_mode.to_string(),
+                diff_sum,
+            )?;
+            queued_item_id = Some(q_item.id);
+            message = format!(
+                "⏳ Repositorio '{}' listo en Staging Local ({}). El agente ya puede hacer commits y push. Pendiente #{} en cola para crear en GitHub con tu Huella/PIN.",
+                clean_name, clean_proxy_url, q_item.id
+            );
+        }
         store.add_audit(
             clean_name,
             "agent",
@@ -263,6 +336,8 @@ pub async fn initialize_managed_repository(
 
     let managed = ManagedRepo {
         name: clean_name.to_string(),
+        display_name: display_name.trim().to_string(),
+        template_id: template_id.trim().to_string(),
         owner: owner.to_string(),
         local_workspace_path: workspace_dir.to_string_lossy().to_string(),
         bare_staging_path: bare_path.to_string_lossy().to_string(),
@@ -287,6 +362,7 @@ pub async fn initialize_managed_repository(
 pub async fn create_github_repo_api(
     secret: &AdminSecret,
     repo_name: &str,
+    description: &str,
     private: bool,
 ) -> Result<String> {
     if secret.admin_pat.trim().starts_with("demo_") || secret.admin_pat.trim() == "local_only" {
@@ -296,11 +372,17 @@ pub async fn create_github_repo_api(
         ));
     }
 
+    let desc_val = if description.trim().is_empty() {
+        "Managed & protected by gitOlorin Bastion"
+    } else {
+        description.trim()
+    };
+
     let payload = serde_json::json!({
         "name": repo_name,
         "private": private,
         "auto_init": false,
-        "description": "Managed & protected by gitOlorin Bastion"
+        "description": desc_val
     })
     .to_string();
 
@@ -405,7 +487,7 @@ pub async fn execute_approved_queue_item(
 
     match item.kind {
         QueueItemKind::CreateRepo => {
-            let gh_url = create_github_repo_api(secret, &item.repo_name, item.private_repo).await?;
+            let gh_url = create_github_repo_api(secret, &item.repo_name, &repo.display_name, item.private_repo).await?;
             // Sync all existing branches from local bare staging to GitHub
             if !secret.admin_pat.trim().starts_with("demo_") && secret.admin_pat.trim() != "local_only" {
                 use base64::{engine::general_purpose::STANDARD as B64, Engine};

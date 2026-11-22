@@ -1,60 +1,73 @@
-# 🧙‍♂️ gitOlorin
+# <img src="static/icon-192.png" width="48" align="absmiddle" alt="gitOlorin" /> gitOlorin
 
 **Local Git Bastion, Credential Broker & Biometric Approval Queue for AI Coding Agents.**  
 *("You Shall Not Pass!" for `main`, `master`, `--force`, and destructive Git operations)*
 
 ---
 
-## El Problema
+## The Problem
 
-Cuando trabajas con agentes de IA (Claude Code, Antigravity, Cursor, Codex, Aider):
-1. **La Fricción de GitHub:** Crear un repositorio nuevo en GitHub, configurar reglas de protección (que GitHub bloquea en repositorios privados gratuitos) y generar un *Fine-Grained PAT* (que no tiene API de creación) toma varios minutos de clics manuales por proyecto.
-2. **El Peligro del Token de Dueño:** Si por prisa le das un token general al agente, un error del modelo o un *indirect prompt injection* puede hacer `git push --force origin main`, reescribir tu historial o eliminar ramas.
+When working with AI coding agents (Claude Code, Antigravity, Cursor, Codex, Aider):
 
----
-
-## Cómo lo resuelve `gitOlorin`
-
-`gitOlorin` es una aplicación multiplataforma portable (1 único binario compilado en Rust con servidor API, Proxy Git Smart HTTP y Frontend Web embebido) que actúa como **único bastión entre los agentes y tu cuenta de GitHub**:
-
-1. **Doble Credencial + Bóveda Biométrica (`AES-256-GCM` + `Argon2id` + `ZeroizeOnDrop`):**
-   - **Credencial 1 (Worker — Bajo privilegio):** El proxy local solo permite usarla para *fast-forward pushes* en ramas secundarias (`feat/*`, `agent/*`).
-   - **Credencial 2 (Admin Vault — Alto privilegio):** Guardada encriptada en `~/.gitolorin/admin.vault`. **Nunca está desencriptada en RAM mientras los agentes trabajan.** Solo se desencripta durante un instante cuando apruebas la cola con tu **Huella del Sistema** (Linux `fprintd`/Polkit, macOS TouchID, Windows Hello) o tu PIN, y la memoria RAM se limpia con ceros (`Zeroize`) inmediatamente al terminar.
-2. **Staging Local Instantáneo (Cero Bloqueos):**
-   - Si un agente pide crear un repositorio proactivamente (`gitolorin init mi-repo`), `gitOlorin` crea al instante un repositorio *bare* local en `~/.gitolorin/staging/mi-repo.git`, configura un token local exclusivo para ese proyecto y deja en tu **Cola de Pendientes** la tarea de crearlo en GitHub.
-   - El agente puede empezar a hacer commits, crear ramas y hacer `git push` de inmediato sin esperarte.
-3. **Inyección Automática en `AGENTS.md` + Jujutsu (`jj`) / Worktrees:**
-   - Al inicializar un repo, `gitOlorin` descarga o verifica **Jujutsu (`jj`)** (o configura `git worktree`) e inyecta automáticamente las instrucciones en `AGENTS.md` para que cualquier agente trabaje con `jj` y envíe Merge Requests a la cola.
-4. **Inspección a Nivel de Protocolo Git (`git-receive-pack`):**
-   - Si un agente intenta hacer `git push origin main`, `git push --force` o borrar una rama remota, el proxy de `gitOlorin` lo intercepta con *"🧙‍♂️ YOU SHALL NOT PASS!"*, aparca los commits de forma segura en una rama temporal y crea un ítem en tu **Cola de Aprobación**.
-5. **Revisión en Lote ("1 Huella y Listo"):**
-   - Cuando tienes tiempo, abres la Web UI (`http://127.0.0.1:9418`) o ejecutas `gitolorin status`, revisas los diffs, marcas los listos y apruebas todo el lote (creación de repos + merges a `main`) poniendo **una sola vez tu huella o PIN**.
+1. **GitHub Setup Friction:** Creating a new repository on GitHub, configuring branch rules, and manually clicking through the web UI to generate a *Fine-Grained PAT* (which GitHub does not allow creating via API) adds minutes of friction to every new project.
+2. **Free-Tier Private Repo Gap:** GitHub Free does not support Branch Rulesets or branch protection on private repositories.
+3. **Owner Token Exposure & Prompt Injection:** Handing a personal access token or `gh` session directly to an agent means a hallucination or indirect prompt injection can run `git push --force origin main`, rewrite history, or delete remote branches.
 
 ---
 
-## Uso Rápido (CLI & Web UI)
+## How `gitOlorin` Solves It
+
+`gitOlorin` is a portable, single-binary Rust application (API server, Git Smart HTTP proxy, embedded Web UI, and native System Tray) that acts as the **single bastion between your AI agents and GitHub**:
+
+1. **Dual-Credential Model & Biometric Vault (`AES-256-GCM` + `Argon2id` + `Zeroize`):**
+   - **Worker Credential (Low Privilege — Optional):** The local proxy only uses it for clean *fast-forward* pushes to secondary feature branches (`feat/*`, `agent/*`).
+   - **Admin Vault (High Privilege):** Stored encrypted in `~/.gitolorin/admin.vault`. **Never decrypted in RAM while agents work.** It is only unsealed for a few seconds when you approve a batch using your **OS Fingerprint / Biometrics** (Linux `pkexec`/Polkit/`fprintd`, macOS Touch ID, Windows Hello) or Vault PIN, and wiped from memory immediately via `Zeroize`.
+2. **Instant Local Staging (Zero Blocking):**
+   - When an agent proactively requests a new repository (`gitolorin init my-repo`), `gitOlorin` immediately creates a local bare staging repository in `~/.gitolorin/staging/my-repo.git`, assigns a per-project local proxy token, and queues `CreateRepo` for your review.
+   - The agent can commit, branch, and `git push` immediately without waiting for you—even offline.
+3. **Automatic `AGENTS.md` Injection + Jujutsu (`jj`) / Git Worktrees:**
+   - During `init`, `gitOlorin` automatically checks/downloads **Jujutsu (`jj`)** (or sets up `git worktree`), configures `origin` to point to the local proxy, and injects workflow & safety rules into `AGENTS.md`.
+4. **Git Protocol-Level Gatekeeper (`git-receive-pack`):**
+   - If an agent attempts `git push origin main`, `git push --force`, or remote branch deletion, `gitOlorin` intercepts it (*"YOU SHALL NOT PASS!"*), safely parks the commits on a temporary ref (`olorin-parked-*` / `olorin-force-*`), sends a desktop notification, and adds it to your **Approval Queue**.
+5. **Batch Review ("One Fingerprint & Done"):**
+   - Whenever you have a moment, open the standalone app (`gitolorin app` or via the **System Tray** icon, ~8.5 MB RAM), inspect the diffs, mark what you want, and approve the entire batch (repo creations + merges to `main`) with **one single Fingerprint or PIN**.
+
+---
+
+## Quick Start
 
 ```bash
-# 1. Levantar el Proxy Git Local + Interfaz Web (http://127.0.0.1:9418)
-gitolorin serve --open
+# 1. Open the standalone desktop App window & start background proxy + System Tray
+gitolorin app
 
-# 2. Configurar tu Bóveda Admin encriptada (también disponible desde la Web UI)
-gitolorin setup-vault --github-user tu-usuario --admin-pat ghp_xxx --pin 1234 --os-bio
+# (Optional on Linux) Install application menu shortcut & icon
+gitolorin install-desktop
 
-# 3. Inicializar un repositorio (Modo Agente / Staging Local instantáneo + Jujutsu en AGENTS.md)
-gitolorin init nuevo-proyecto --vcs jj
+# 2. Configure your encrypted Admin Vault (also available from the Web UI)
+gitolorin setup-vault --github-user <your-user> --admin-pat <ghp_xxx> --pin <PIN> --os-bio
 
-# 4. Inicializar un repositorio (Modo Humano Interactivo: desbloquea con huella y crea en GitHub al instante)
-gitolorin init nuevo-proyecto --vcs jj --bio
+# 3. Initialize a repository (Agent / Local Staging mode + Jujutsu in AGENTS.md)
+gitolorin init my-project --vcs jj
 
-# 5. Crear un Merge Request en la cola hacia main
-gitolorin mr --repo nuevo-proyecto --source feat/login --target main --title "Implementar OAuth2"
+# 4. Initialize a repository (Interactive Owner mode: unlock with fingerprint & create on GitHub now)
+gitolorin init my-project --vcs jj --bio
 
-# 6. Ver pendientes y aprobar todo el lote con 1 sola Huella o PIN
+# 5. Enqueue a Merge Request targeting main
+gitolorin mr --repo my-project --source feat/login --target main --title "Implement OAuth2"
+
+# 6. Inspect queue and approve everything in one batch with OS Fingerprint or PIN
 gitolorin status
 gitolorin approve --bio --all
 ```
 
-## Licencia
+---
 
-MIT
+## Cross-Platform Support
+
+- **Linux:** Native D-Bus System Tray (`ksni`), Polkit/`fprintd` fingerprint unlock, `notify-send` alerts, and standalone Chromium/Chrome `--app` window.
+- **macOS:** Native `tray-icon`, Touch ID / `osascript` prompt, and standalone browser app window.
+- **Windows:** Native `tray-icon`, Windows Hello (`UserConsentVerifier`), and standalone Edge/Chrome `--app` window.
+
+## License
+
+[MIT](LICENSE)

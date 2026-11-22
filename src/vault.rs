@@ -289,7 +289,25 @@ impl VaultManager {
     pub fn prompt_os_biometric_consent(_reason: &str) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
-            // First check if fprintd-verify is available and user has enrolled fingerprints
+            let has_gui =
+                std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok();
+
+            // In a graphical session, invoke Polkit immediately (0ms delay) so it shows the
+            // native fingerprint/password dialog directly without waiting on headless fprintd-verify.
+            if has_gui && Path::new("/usr/bin/pkexec").is_file() {
+                let status = Command::new("pkexec")
+                    .arg("/usr/bin/true")
+                    .status()
+                    .context("Error invocando Polkit (pkexec) para autenticación del sistema")?;
+                if status.success() {
+                    return Ok(());
+                }
+                return Err(anyhow!(
+                    "Autenticación del sistema (Huella/Polkit) cancelada o fallida."
+                ));
+            }
+
+            // Headless / TTY fallback: use fprintd-verify directly if enrolled
             if Path::new("/usr/bin/fprintd-verify").is_file() {
                 if let Ok(out) = Command::new("fprintd-list")
                     .arg(std::env::var("USER").unwrap_or_else(|_| "root".to_string()))
@@ -304,7 +322,7 @@ impl VaultManager {
                     }
                 }
             }
-            // Fallback to Polkit graphical/PAM prompt (which integrates with pam_fprintd or system password)
+
             if Path::new("/usr/bin/pkexec").is_file() {
                 let status = Command::new("pkexec")
                     .arg("/usr/bin/true")

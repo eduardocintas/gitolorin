@@ -52,6 +52,10 @@ pub struct QueueItem {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ManagedRepo {
     pub name: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub template_id: String,
     pub owner: String,
     pub local_workspace_path: String,
     pub bare_staging_path: String,

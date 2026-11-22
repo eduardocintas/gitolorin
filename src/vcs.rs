@@ -110,64 +110,109 @@ pub async fn ensure_jj_installed(base_dir: &Path) -> Result<PathBuf> {
     Ok(jj_bin)
 }
 
-/// Generates or updates `AGENTS.md` in the target project root so any AI coding agent
-/// (Claude Code, Antigravity, Cursor, Codex, Aider) automatically follows the chosen VCS workflow
-/// and knows how to submit MRs to the gitOlorin queue without attempting forbidden direct pushes to `main`.
+pub const GITOLORIN_SKILL_MD: &str = r#"---
+name: gitolorin
+description: >-
+  Rules and workflows for repositories governed by gitOlorin (Local Git Bastion & Biometric Approval Queue).
+  Load this skill whenever working in a repo whose AGENTS.md says it is protected by gitOlorin.
+---
+
+# gitOlorin — Agent Workflow & Safety Rules ("You Shall Not Pass!")
+
+Repositories governed by `gitOlorin` route `origin` through the local security proxy (`http://127.0.0.1:9418/git/<repo>.git`) with a per-repository token.
+
+> **Prerequisite:** If `gitolorin` is not installed or running on this machine, install it from [github.com/eduardocintas/gitolorin](https://github.com/eduardocintas/gitolorin) and start it with `gitolorin app`.
+
+## Strict Restrictions
+1. **NEVER push directly to `main` / `master` / `production` / `release`:** Direct pushes are intercepted by `gitOlorin`, parked on a temporary ref, and queued for human biometric approval.
+2. **NEVER run `git push --force` or delete remote branches/tags:** History rewriting on remote branches is blocked for agents. Add a new commit or create a new branch instead.
+3. **NEVER search for or ask for GitHub PATs (`ghp_...`):** `gitOlorin` handles authentication transparently for feature branches.
+
+## Workflow by VCS Mode
+
+### 1. Jujutsu (`jj` colocated with Git)
+- **`jj` is the primary VCS.** Use `jj status`, `jj log`, `jj diff`, `jj describe -m "..."`, and `jj new` for all checkpoints, atomic changes, and verification gates.
+- **NEVER use `git add`, `git commit`, or `git status` as workflow or gate checks** in a `jj` colocated repo (doing so breaks the expected `jj` working-copy & bookmark model).
+- Every working-tree edit is automatically tracked as a snapshot (no `git add` required).
+- If an experiment goes wrong, roll back atomically with `jj undo` or `jj op restore`.
+- Describe your change, advance to a new working-copy change, and push a feature bookmark:
+  ```bash
+  jj status
+  jj describe -m "feat: concise summary"
+  jj new
+  jj bookmark set feat/<task> -r @-
+  jj git push --bookmark feat/<task> --allow-new
+  ```
+
+### 2. Git Worktrees (`worktree`)
+- Use isolated worktrees for parallel subagents without colliding on the same working directory:
+  ```bash
+  git worktree add ../wt-<repo>-<task> -b agent/<task>
+  ```
+- Commit and push to your `agent/<task>` or `feat/<task>` branch:
+  ```bash
+  git push -u origin feat/<task>
+  ```
+
+### 3. Standard Git (`git`)
+- Always work on feature/agent branches (`feat/*`, `fix/*`, `agent/*`):
+  ```bash
+  git checkout -b feat/<task>
+  git push -u origin feat/<task>
+  ```
+
+## Proposing Changes to `main` (Merge Request Queue)
+Once your feature branch is pushed, enqueue a Merge Request for human review and 1-fingerprint batch approval *(Exact subcommand is `gitolorin mr`, NOT `gitolorin mr create`.)*:
+```bash
+gitolorin mr --repo <repo> --source feat/<task> --target main --title "<Title>"
+```
+"#;
+
+/// Installs or updates the global `gitolorin` agent skill (`SKILL.md`) for Progressive Disclosure
+/// in `~/.gemini/config/skills/gitolorin/SKILL.md` and `~/.agents/skills/gitolorin/SKILL.md`.
+pub fn ensure_gitolorin_skill_installed() -> Result<()> {
+    if let Some(home) = dirs::home_dir() {
+        for rel in [
+            ".gemini/config/skills/gitolorin/SKILL.md",
+            ".agents/skills/gitolorin/SKILL.md",
+        ] {
+            let p = home.join(rel);
+            if let Some(parent) = p.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(&p, GITOLORIN_SKILL_MD);
+        }
+    }
+    Ok(())
+}
+
+/// Generates or updates `AGENTS.md` and `.agents/skills/gitolorin/SKILL.md` in the target project root
+/// using Progressive Disclosure: keeps `AGENTS.md` to a single concise line referencing the local skill.
 pub fn inject_agents_md(
     project_dir: &Path,
     repo_name: &str,
     vcs_mode: &str,
-    proxy_remote_url: &str,
+    _proxy_remote_url: &str,
 ) -> Result<()> {
+    let _ = ensure_gitolorin_skill_installed();
+
+    let local_skill_path = project_dir.join(".agents/skills/gitolorin/SKILL.md");
+    if let Some(parent) = local_skill_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&local_skill_path, GITOLORIN_SKILL_MD)?;
+
     let agents_path = project_dir.join("AGENTS.md");
 
-    let vcs_instructions = match vcs_mode {
-        "jj" => format!(
-            r#"### Version Control Mode: **Jujutsu (`jj`) Colocated with Git**
-- **Trabaja en este repositorio con Jujutsu (`jj`)** (ya inicializado en modo `--colocate` con `.jj` y `.git`).
-- Cada modificación en el árbol de trabajo es automáticamente un commit/snapshot (no necesitas `git add`).
-- Si un cambio o experimento sale mal, usa `jj undo` o `jj op restore` para revertir de forma atómica.
-- Para publicar tus cambios en una rama de trabajo hacia el proxy `gitOlorin`:
-  1. Crea o mueve un bookmark a tu cambio: `jj bookmark set feat/<descripcion> -r @`
-  2. Empuja la rama de trabajo: `jj git push --bookmark feat/<descripcion> --allow-new`
-- Para proponer que tus cambios pasen a `main`:
-  - Ejecuta: `gitolorin mr create --repo {repo_name} --source feat/<descripcion> --target main --title "<Título>"`"#
-        ),
-        "worktree" => format!(
-            r#"### Version Control Mode: **Git Worktrees (Árboles de Trabajo Paralelos)**
-- **Trabaja en este repositorio usando ramas de trabajo aisladas y `git worktree`** cuando ejecutes subagentes en paralelo.
-- Para crear un árbol de trabajo aislado para una subtarea:
-  `git worktree add ../wt-{repo_name}-<tarea> -b agent/<tarea>`
-- Haz commits incrementales y empuja siempre a tu rama `agent/<tarea>` o `feat/<tarea>`:
-  `git push -u origin feat/<tarea>`
-- Para proponer un Merge Request hacia `main`:
-  `gitolorin mr create --repo {repo_name} --source feat/<tarea> --target main --title "<Título>"`"#
-        ),
-        _ => format!(
-            r#"### Version Control Mode: **Git Estándar (Ramas de Trabajo Protegidas)**
-- Trabaja siempre sobre ramas de funcionalidad o agente (`feat/*`, `fix/*`, `agent/*`).
-- Empuja tus avances libremente a tu rama secundaria:
-  `git push -u origin feat/<tarea>`
-- Para proponer que tus cambios se fusionen a `main`:
-  `gitolorin mr create --repo {repo_name} --source feat/<tarea> --target main --title "<Título>"`"#
-        ),
+    let (vcs_hint, vcs_short) = match vcs_mode {
+        "jj" => ("jj colocated — use jj, NOT git commit/status", "jj"),
+        "worktree" => ("git worktree", "worktree"),
+        _ => ("git (feature branches)", "git"),
     };
 
     let section = format!(
-        r#"<!-- GITOLORIN-MANAGED-START -->
-# 🧙‍♂️ gitOlorin — Reglas de Control de Versiones y Seguridad para Agentes IA
-
-Este repositorio está protegido y gobernado por **gitOlorin** (Local Git Bastion & Biometric Approval Queue).
-El remote `origin` (`{proxy_remote_url}`) apunta al proxy de seguridad local de `gitOlorin`.
-
-{vcs_instructions}
-
-### ⛔ Restricciones Estrictas ("You Shall Not Pass!")
-1. **PROHIBIDO hacer push directo a `main` / `master`:** Cualquier push directo a `main` será interceptado por el proxy `gitOlorin` y retenido en la Cola de Aprobación Humana (requiere huella/PIN del propietario).
-2. **PROHIBIDO `git push --force` o borrar ramas remotas:** La reescritura de historial remoto está bloqueada para agentes. Si necesitas corregir algo, añade un nuevo commit o crea una rama nueva.
-3. **Cero exposición de credenciales:** No busques ni pidas tokens de GitHub (`ghp_...`). `gitOlorin` inyecta tokens efímeros de 1 solo repositorio automáticamente al hacer push a ramas `feat/*` o `agent/*`.
-<!-- GITOLORIN-MANAGED-END -->
-"#
+        "<!-- GITOLORIN-MANAGED-START -->\n> **You shall not pass!** This repo (`{}`) is protected by **gitOlorin** (VCS: `{}`). See skill `gitolorin` (`.agents/skills/gitolorin/SKILL.md`) for commit, push, `{}`, and MR rules.\n<!-- GITOLORIN-MANAGED-END -->\n",
+        repo_name, vcs_hint, vcs_short
     );
 
     if agents_path.is_file() {

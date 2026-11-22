@@ -3,7 +3,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>gitOlorin 🧙‍♂️ — Git Bastion & Biometric Approval Queue</title>
+  <title>gitOlorin — Git Bastion & Biometric Approval Queue</title>
+  <link rel="icon" type="image/png" href="/static/icon-192.png" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <meta name="theme-color" content="#0d1117" />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -11,7 +14,7 @@
     <!-- Top Header -->
     <header class="topbar">
       <div class="brand">
-        <span class="brand-logo">🧙‍♂️</span>
+        <img src="/static/icon-192.png" class="brand-logo-img" width="46" height="46" alt="gitOlorin" style="border-radius: 10px;" />
         <div>
           <h1>gitOlorin <span class="badge-ver">v0.1.0</span></h1>
           <p class="subtitle">Local Git Bastion, Credential Broker &amp; Biometric Approval Queue for AI Agents</p>
@@ -49,7 +52,7 @@
         </div>
         <div class="batch-actions">
           <button id="btn-approve-selected" class="btn btn-primary" onclick="openUnlockModal(false)">
-            指纹 Aprobar Marcados (<span id="lbl-ready-count">0</span>)
+            🔐 Aprobar Marcados (<span id="lbl-ready-count">0</span>)
           </button>
           <button id="btn-approve-all" class="btn btn-accent" onclick="openUnlockModal(true)">
             ⚡ Aprobar Todos con Huella/PIN
@@ -67,11 +70,37 @@
       <div class="grid-2">
         <section class="card">
           <h3>✨ Crear / Vincular Repositorio Protegido</h3>
-          <p class="muted">Configura el proxy local, genera token aislado para este único repo, inicializa Jujutsu (`jj`) o Git Worktrees e inyecta las reglas en <code>AGENTS.md</code>.</p>
+          <p class="muted">Configura el proxy local, genera token aislado para este único repo, inicializa Jujutsu (<code>jj</code>) o Git Worktrees e inyecta las reglas en <code>AGENTS.md</code>.</p>
           <form id="form-init-repo" onsubmit="handleInitRepo(event)">
             <div class="form-group">
-              <label>Nombre del Repositorio</label>
-              <input type="text" id="inp-repo-name" placeholder="ej. mi-nuevo-proyecto" required />
+              <label>Nombre del Repositorio (slug)</label>
+              <input type="text" id="inp-repo-name" placeholder="ej. jmmdm" required />
+              <small id="repo-name-check-status"></small>
+            </div>
+            <div class="form-group">
+              <label>Nombre largo / Descripción en GitHub</label>
+              <input type="text" id="inp-repo-display-name" placeholder="ej. Just Make My Desktop Mine" />
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+                  <label style="margin-bottom:0;">Plantilla de Proyecto (Template)</label>
+                  <button type="button" class="btn" style="padding:3px 9px;font-size:0.78rem;" onclick="openTemplatesModal()">⚙️ Administrar Templates</button>
+                </div>
+                <select id="sel-repo-template">
+                  <option value="empty">Vacío (Solo Git/jj + AGENTS.md)</option>
+                  <option value="rust-web-app">Rust + Web UI Portable (Axum + static/)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Licencia (<code>LICENSE</code>)</label>
+                <select id="sel-repo-license">
+                  <option value="MIT" selected>MIT</option>
+                  <option value="Apache-2.0">Apache-2.0</option>
+                  <option value="GPL-3.0-or-later">GPL-3.0-or-later</option>
+                  <option value="none">Sin archivo LICENSE</option>
+                </select>
+              </div>
             </div>
             <div class="form-group">
               <label>Directorio Local (Workspace)</label>
@@ -79,7 +108,7 @@
             </div>
             <div class="form-row">
               <div class="form-group">
-                <label>Flujo para Agentes (`AGENTS.md`)</label>
+                <label>Flujo para Agentes (<code>AGENTS.md</code>)</label>
                 <select id="sel-repo-vcs">
                   <option value="jj">Jujutsu (jj --colocate) [Recomendado Agentes]</option>
                   <option value="worktree">Git Worktrees (Subagentes paralelos)</option>
@@ -97,9 +126,9 @@
             <div class="form-group">
               <label>Modo de Creación</label>
               <select id="sel-repo-unlock">
-                <option value="agent_queue">⏳ Modo Staging Local Instantáneo (Encolar creación en GitHub)</option>
-                <option value="os_bio">指纹 Interactivo: Desbloquear con Huella del Sistema y crear en GitHub ya</option>
-                <option value="pin">🔑 Interactivo: Desbloquear con PIN de Bóveda y crear en GitHub ya</option>
+                <option value="os_bio" selected>🔐 Crear en GitHub ahora (Huella del Sistema / Polkit)</option>
+                <option value="pin">🔑 Crear en GitHub ahora (Fallback: PIN de Bóveda)</option>
+                <option value="agent_queue">⏳ Solo Staging Local (Encolar creación — modo agentes / offline)</option>
               </select>
             </div>
             <div id="grp-repo-pin" class="form-group hidden">
@@ -203,7 +232,7 @@
   <div id="modal-unlock" class="modal-backdrop hidden">
     <div class="modal-card">
       <div class="modal-header">
-        <h3>🧙‍♂️ Autorizar Lote en Bóveda Admin</h3>
+        <h3><img src="/static/icon-192.png" width="22" height="22" style="vertical-align:middle;border-radius:5px;margin-right:6px;" alt="" />Autorizar Lote en Bóveda Admin</h3>
         <button class="btn-close" onclick="closeUnlockModal()">✕</button>
       </div>
       <p id="unlock-modal-desc" class="muted">
@@ -211,7 +240,7 @@
       </p>
       <div class="unlock-methods">
         <button class="btn btn-accent full-w" onclick="submitBatchApproval('os_bio')">
-          指纹 Usar Huella del Sistema (fprintd / Polkit / TouchID / WinHello)
+          🔐 Usar Huella del Sistema (fprintd / Polkit / TouchID / WinHello)
         </button>
         <div class="divider"><span>o desbloquear con PIN de Bóveda</span></div>
         <div class="form-group">
@@ -222,6 +251,46 @@
         </button>
       </div>
       <div id="unlock-feedback" class="feedback-box hidden"></div>
+    </div>
+  </div>
+
+  <!-- MODAL: ADMINISTRADOR DE TEMPLATES -->
+  <div id="modal-templates" class="modal-backdrop hidden">
+    <div class="modal-card modal-large">
+      <div class="modal-header">
+        <h3>⚙️ Administrar Plantillas de Proyecto (Templates)</h3>
+        <button class="btn-close" onclick="closeTemplatesModal()">✕</button>
+      </div>
+      <p class="muted">Los templates se guardan en <code>~/.gitolorin/templates/&lt;id&gt;/</code> y admiten placeholders <code>{{REPO_NAME}}</code>, <code>{{DISPLAY_NAME}}</code> y <code>{{OWNER}}</code>.</p>
+      <div class="grid-2">
+        <div>
+          <h4 style="margin-bottom:8px;">📦 Plantillas Disponibles</h4>
+          <div id="templates-modal-list"></div>
+        </div>
+        <div>
+          <h4 style="margin-bottom:8px;">➕ Crear / Actualizar Template</h4>
+          <form onsubmit="handleSaveTemplate(event)">
+            <div class="form-group">
+              <label>ID del Template</label>
+              <input type="text" id="inp-tpl-id" placeholder="ej. python-cli" required />
+            </div>
+            <div class="form-group">
+              <label>Nombre visible</label>
+              <input type="text" id="inp-tpl-name" placeholder="ej. Python CLI + Tests" required />
+            </div>
+            <div class="form-group">
+              <label>Descripción</label>
+              <input type="text" id="inp-tpl-desc" placeholder="Descripción corta..." />
+            </div>
+            <div class="form-group">
+              <label>Archivos JSON (<code>{"ruta": "contenido"}</code>)</label>
+              <textarea id="inp-tpl-files" rows="7" style="width:100%;padding:9px;background:#0d1117;border:1px solid var(--border);border-radius:7px;color:var(--text);font-family:monospace;font-size:0.82rem;">{"README.md": "# {{DISPLAY_NAME}}\n", ".gitignore": "__pycache__/\n"}</textarea>
+            </div>
+            <button type="submit" class="btn btn-primary full-w">💾 Guardar Template</button>
+          </form>
+          <div id="tpl-feedback" class="feedback-box hidden"></div>
+        </div>
+      </div>
     </div>
   </div>
 

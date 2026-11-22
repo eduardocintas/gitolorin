@@ -1,7 +1,10 @@
+pub mod autostart;
 pub mod github;
 pub mod inspector;
 pub mod proxy;
 pub mod queue;
+pub mod templates;
+pub mod tray;
 pub mod vault;
 pub mod vcs;
 
@@ -41,11 +44,35 @@ enum Commands {
         /// Automatically open the Web UI in the default browser
         #[arg(long)]
         open: bool,
+        /// Disable the native System Tray icon
+        #[arg(long)]
+        no_tray: bool,
+    },
+    /// Launch gitOlorin as a standalone frameless desktop App window (starts background daemon if needed)
+    App,
+    /// Install desktop menu entry & icon on Linux (~/.local/share/applications/gitolorin.desktop)
+    InstallDesktop,
+    /// Manage cross-platform OS autostart (`enable`, `disable`, or `status`)
+    Autostart {
+        /// Action: enable | disable | status
+        action: String,
     },
     /// Initialize or link a repository with gitOlorin proxy, scoped token, VCS tool (jj/git/worktree), and AGENTS.md
     Init {
         /// Repository name (e.g. my-project)
         name: String,
+        /// Long display name / GitHub description (e.g. "Just Make My Desktop Mine")
+        #[arg(long, default_value = "")]
+        display_name: String,
+        /// Starter project template ID (e.g. "empty", "rust-web-app")
+        #[arg(long, default_value = "empty")]
+        template: String,
+        /// Open-source license to generate (`MIT`, `Apache-2.0`, `GPL-3.0-or-later`, `none`)
+        #[arg(long, default_value = "MIT")]
+        license: String,
+        /// Initialize locally without queuing a GitHub repo creation
+        #[arg(long)]
+        local_only: bool,
         /// Target workspace path (defaults to current directory or /home/edu/git/pub/<name>)
         #[arg(long)]
         path: Option<PathBuf>,
@@ -119,17 +146,20 @@ fn resolve_base_dir(custom: Option<PathBuf>) -> PathBuf {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let base_dir_arg = cli.data_dir.clone();
     let base_dir = resolve_base_dir(cli.data_dir);
+    let _ = templates::ensure_builtin_templates(&base_dir);
+    let _ = vcs::ensure_gitolorin_skill_installed();
     let vault = VaultManager::new(base_dir.clone())?;
     let store = StateStore::new(base_dir.clone())?;
 
-    match cli.command.unwrap_or(Commands::Serve { open: false }) {
-        Commands::Serve { open } => {
+    match cli.command.unwrap_or(Commands::Serve { open: false, no_tray: false }) {
+        Commands::Serve { open, no_tray } => {
             let addr = format!("127.0.0.1:{}", cli.port);
-            let url = format!("http://{}", addr);
+            let url = format!("http://gitolorin.localhost:{}", cli.port);
             println!("🧙‍♂️ gitOlorin v0.1.0 — Local Git Bastion & Biometric Approval Queue");
             println!("   ├─ Web UI & Dashboard : {}", url);
-            println!("   ├─ Git Smart Proxy    : {}/git/<repo>.git", url);
+            println!("   ├─ Git Smart Proxy    : http://127.0.0.1:{}/git/<repo>.git", cli.port);
             println!("   └─ Datos y Staging    : {}", base_dir.display());
 
             if open {
@@ -137,14 +167,101 @@ async fn main() -> Result<()> {
             }
 
             let state = Arc::new(AppState {
-                base_dir,
+                base_dir: base_dir.clone(),
                 port: cli.port,
                 vault,
                 store,
             });
+
+            if !no_tray {
+                let url_for_tray = url.clone();
+                let base_for_tray = base_dir.clone();
+                tray::spawn_tray(
+                    Arc::clone(&state),
+                    cli.port,
+                    Arc::new(move || {
+                        let _ = open_app_window(&url_for_tray, &base_for_tray);
+                    }),
+                );
+            }
+
             let app = build_router(state);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
+            if let Ok(v6_listener) =
+                tokio::net::TcpListener::bind(format!("[::1]:{}", cli.port)).await
+            {
+                let app_v6 = app.clone();
+                tokio::spawn(async move {
+                    let _ = axum::serve(v6_listener, app_v6).await;
+                });
+            }
             axum::serve(listener, app).await?;
+        }
+        Commands::App => {
+            let addr_sock: std::net::SocketAddr = format!("127.0.0.1:{}", cli.port).parse()?;
+            let is_running = std::net::TcpStream::connect_timeout(
+                &addr_sock,
+                std::time::Duration::from_millis(250),
+            )
+            .is_ok();
+
+            if !is_running {
+                let exe = std::env::current_exe()?;
+                let mut cmd = std::process::Command::new(exe);
+                if let Some(ref d) = base_dir_arg {
+                    cmd.arg("--data-dir").arg(d);
+                }
+                cmd.arg("--port")
+                    .arg(cli.port.to_string())
+                    .arg("serve")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    cmd.process_group(0);
+                }
+                let _ = cmd.spawn()?;
+
+                for _ in 0..30 {
+                    if std::net::TcpStream::connect_timeout(
+                        &addr_sock,
+                        std::time::Duration::from_millis(100),
+                    )
+                    .is_ok()
+                    {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+
+            let url = format!("http://gitolorin.localhost:{}", cli.port);
+            open_app_window(&url, &base_dir)?;
+            println!("gitOlorin App abierta en {}", url);
+        }
+        Commands::InstallDesktop => {
+            install_desktop_entry()?;
+        }
+        Commands::Autostart { action } => {
+            match action.trim().to_lowercase().as_str() {
+                "enable" | "on" | "1" => {
+                    let msg = autostart::set_autostart(true)?;
+                    println!("✅ {}", msg);
+                }
+                "disable" | "off" | "0" => {
+                    let msg = autostart::set_autostart(false)?;
+                    println!("✅ {}", msg);
+                }
+                _ => {
+                    let enabled = autostart::is_autostart_enabled();
+                    println!(
+                        "⚡ Inicio automático: {}",
+                        if enabled { "✅ Activado" } else { "Desactivado" }
+                    );
+                }
+            }
         }
         Commands::SetupVault {
             github_user,
@@ -163,6 +280,10 @@ async fn main() -> Result<()> {
         }
         Commands::Init {
             name,
+            display_name,
+            template,
+            license,
+            local_only,
             path,
             vcs,
             public,
@@ -191,12 +312,16 @@ async fn main() -> Result<()> {
                 &base_dir,
                 &store,
                 &name,
+                &display_name,
+                &template,
+                &license,
                 &wcfg.github_username,
                 &ws_path,
                 !public,
                 &vcs,
                 cli.port,
                 secret_opt.as_ref(),
+                local_only,
             )
             .await?;
 
@@ -349,6 +474,146 @@ fn open_browser(url: &str) -> Result<()> {
         let _ = std::process::Command::new("cmd")
             .args(["/C", "start", url])
             .spawn();
+    }
+    Ok(())
+}
+
+fn open_app_window(url: &str, base_dir: &std::path::Path) -> Result<()> {
+    let app_arg = format!("--app={}", url);
+    let profile_dir = base_dir.join("webapp-profile");
+    let _ = std::fs::create_dir_all(&profile_dir);
+    let profile_arg = format!("--user-data-dir={}", profile_dir.display());
+    let profile_str = profile_dir.to_string_lossy().to_string();
+
+    #[cfg(target_os = "linux")]
+    {
+        // Single-instance check: if an app window using this isolated profile is already open,
+        // focus it instead of spawning a duplicate window.
+        if let Ok(out) = std::process::Command::new("pgrep")
+            .args(["-f", &profile_str])
+            .output()
+        {
+            if out.status.success() && !out.stdout.is_empty() {
+                let _ = std::process::Command::new("wmctrl")
+                    .args(["-a", "gitOlorin"])
+                    .status();
+                let _ = std::process::Command::new("xdotool")
+                    .args(["search", "--name", "gitOlorin", "windowactivate"])
+                    .status();
+                return Ok(());
+            }
+        }
+
+        let candidates = [
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "brave-browser",
+            "microsoft-edge",
+        ];
+        for bin in candidates {
+            if let Ok(child) = std::process::Command::new(bin)
+                .args([
+                    &app_arg,
+                    &profile_arg,
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-background-mode",
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                drop(child);
+                return Ok(());
+            }
+        }
+        return open_browser(url);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = &profile_str;
+        let apps = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        ];
+        for bin in apps {
+            if std::path::Path::new(bin).is_file() {
+                if std::process::Command::new(bin)
+                    .args([&app_arg, &profile_arg, "--no-first-run"])
+                    .spawn()
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            }
+        }
+        return open_browser(url);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = &profile_str;
+        for bin in ["msedge", "chrome"] {
+            if std::process::Command::new(bin)
+                .args([&app_arg, &profile_arg, "--no-first-run"])
+                .spawn()
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        return open_browser(url);
+    }
+
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+fn install_desktop_entry() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let data_home = std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".local/share"));
+
+        let icon_dir = data_home.join("icons/hicolor/512x512/apps");
+        let apps_dir = data_home.join("applications");
+        std::fs::create_dir_all(&icon_dir)?;
+        std::fs::create_dir_all(&apps_dir)?;
+
+        let icon_path = icon_dir.join("gitolorin.png");
+        std::fs::write(&icon_path, include_bytes!("../static/icon-512.png"))?;
+
+        let exe_path = std::env::current_exe()
+            .unwrap_or_else(|_| PathBuf::from("/home/edu/.local/bin/gitolorin"));
+        let desktop_path = apps_dir.join("gitolorin.desktop");
+        let desktop_content = format!(
+            "[Desktop Entry]\n\
+            Version=1.0\n\
+            Type=Application\n\
+            Name=gitOlorin\n\
+            Comment=Local Git Bastion & Biometric Approval Queue for AI Agents\n\
+            Exec={} app\n\
+            Icon={}\n\
+            Terminal=false\n\
+            StartupNotify=true\n\
+            StartupWMClass=chrome-gitolorin.localhost__-Default\n\
+            Categories=Development;Security;\n",
+            exe_path.display(),
+            icon_path.display()
+        );
+        std::fs::write(&desktop_path, desktop_content)?;
+        println!("✅ Entrada de escritorio instalada en {}", desktop_path.display());
+        println!("   └─ Icono PNG instalado en {}", icon_path.display());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        println!("ℹ️ install-desktop está pensado para menús de escritorio XDG en Linux.");
     }
     Ok(())
 }

@@ -31,12 +31,19 @@ pub struct AppState {
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const STYLES_CSS: &str = include_str!("../static/styles.css");
 const APP_JS: &str = include_str!("../static/app.js");
+const ICON_192_PNG: &[u8] = include_bytes!("../static/icon-192.png");
+const ICON_512_PNG: &[u8] = include_bytes!("../static/icon-512.png");
+const MANIFEST_JSON: &str = include_str!("../static/manifest.webmanifest");
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
-        // Embedded Portable Web UI
+        // Embedded Portable Web UI & PWA Manifest
         .route("/", get(serve_index))
         .route("/index.html", get(serve_index))
+        .route("/manifest.webmanifest", get(serve_manifest))
+        .route("/favicon.ico", get(serve_icon_192))
+        .route("/static/icon-192.png", get(serve_icon_192))
+        .route("/static/icon-512.png", get(serve_icon_512))
         .route("/static/styles.css", get(serve_css))
         .route("/static/app.js", get(serve_js))
         // Git Smart HTTP Proxy Endpoints (`/git/:repo/info/refs`, `/git/:repo/git-upload-pack`, `/git/:repo/git-receive-pack`)
@@ -45,8 +52,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/git/:repo/git-receive-pack", post(git_receive_pack))
         // REST API for Web UI & CLI
         .route("/api/status", get(api_status))
+        .route("/api/autostart", post(api_autostart))
         .route("/api/vault/setup", post(api_vault_setup))
+        .route("/api/repos/check-name", get(api_check_repo_name))
         .route("/api/repos/init", post(api_repo_init))
+        .route("/api/templates", get(api_templates_list).post(api_templates_save))
+        .route("/api/templates/:id", axum::routing::delete(api_templates_delete))
         .route("/api/mr/create", post(api_mr_create))
         .route("/api/queue/:id/toggle", post(api_queue_toggle))
         .route("/api/queue/:id/reject", post(api_queue_reject))
@@ -57,6 +68,30 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
 async fn serve_index() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+async fn serve_manifest() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/manifest+json; charset=utf-8",
+        )],
+        MANIFEST_JSON,
+    )
+}
+
+async fn serve_icon_192() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "image/png")],
+        ICON_192_PNG,
+    )
+}
+
+async fn serve_icon_512() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "image/png")],
+        ICON_512_PNG,
+    )
 }
 
 async fn serve_css() -> impl IntoResponse {
@@ -323,6 +358,10 @@ async fn git_receive_pack(
             false,
             &format!("{}{}", pre_eval.human_reason, q_id_note),
         );
+        send_os_notification(
+            "🧙‍♂️ gitOlorin: YOU SHALL NOT PASS!",
+            &format!("Repo '{}': {}", repo_name, pre_eval.human_reason),
+        );
 
         let rejection_pkt = build_git_receive_pack_rejection(
             &first_ref,
@@ -391,6 +430,10 @@ async fn git_receive_pack(
             false,
             &format!("Force-push bloqueado por pre-receive hook en {}", first_ref),
         );
+        send_os_notification(
+            "🧙‍♂️ gitOlorin: YOU SHALL NOT PASS!",
+            &format!("Repo '{}': Force-push (non-fast-forward) bloqueado en {}", repo_name, first_ref),
+        );
     } else {
         // 3. Clean fast-forward push on a feature branch (`feat/*`, `agent/*`)!
         // If this repository is already synced with GitHub and we have a low-privilege Worker Token,
@@ -428,6 +471,36 @@ async fn git_receive_pack(
         stdout,
     )
         .into_response()
+}
+
+fn send_os_notification(title: &str, body: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("notify-send")
+            .args(["-a", "gitOlorin", "-i", "gitolorin", title, body])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "display notification \"{}\" with title \"{}\"",
+            body.replace('"', "'"),
+            title.replace('"', "'")
+        );
+        let _ = Command::new("osascript")
+            .args(["-e", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (title, body);
+    }
 }
 
 fn run_git_receive_pack_bytes(
@@ -525,8 +598,10 @@ async fn api_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
         "app": "gitOlorin",
         "version": "0.1.0",
         "proxy_url": format!("http://127.0.0.1:{}", state.port),
+        "autostart_enabled": crate::autostart::is_autostart_enabled(),
         "vault": vault_status,
         "vcs_tools": vcs_tools,
+        "templates": crate::templates::list_templates(&state.base_dir),
         "repos": repos_list,
         "queue": queue_list,
         "audit_log": db.audit_log,
@@ -536,6 +611,27 @@ async fn api_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
             "repos_total": repos_list.len(),
         }
     }))
+}
+
+#[derive(Deserialize)]
+struct AutostartReq {
+    enabled: bool,
+}
+
+async fn api_autostart(Json(req): Json<AutostartReq>) -> Response {
+    match crate::autostart::set_autostart(req.enabled) {
+        Ok(msg) => Json(serde_json::json!({
+            "ok": true,
+            "enabled": crate::autostart::is_autostart_enabled(),
+            "message": msg
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -591,15 +687,163 @@ async fn api_vault_setup(
     }
 }
 
+async fn api_check_repo_name(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let name = params.get("name").map(|s| s.trim()).unwrap_or("").to_string();
+    let valid = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+
+    if !valid {
+        return Json(serde_json::json!({
+            "ok": false,
+            "valid": false,
+            "message": "Nombre inválido (usa solo letras, números, guiones o puntos)."
+        }));
+    }
+
+    let exists_local = state.store.get_repo(&name).is_some();
+    let owner = state.vault.load_worker_config().github_username;
+    let name_clone = name.clone();
+    let owner_clone = owner.clone();
+
+    let (exists_in_owner, exact_public_matches) = tokio::task::spawn_blocking(move || {
+        let mut in_owner = false;
+        if !owner_clone.is_empty() {
+            let url = format!("https://api.github.com/repos/{}/{}", owner_clone, name_clone);
+            if let Ok(out) = Command::new("curl")
+                .args([
+                    "-sS",
+                    "-o",
+                    "/dev/null",
+                    "-w",
+                    "%{http_code}",
+                    "-H",
+                    "User-Agent: gitolorin/0.1.0",
+                    &url,
+                ])
+                .output()
+            {
+                let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if code == "200" {
+                    in_owner = true;
+                }
+            }
+        }
+
+        let mut matches: Vec<String> = Vec::new();
+        let search_url = format!(
+            "https://api.github.com/search/repositories?q={}+in:name&per_page=5",
+            name_clone
+        );
+        if let Ok(out) = Command::new("curl")
+            .args([
+                "-sS",
+                "-H",
+                "User-Agent: gitolorin/0.1.0",
+                &search_url,
+            ])
+            .output()
+        {
+            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                if let Some(items) = val.get("items").and_then(|v| v.as_array()) {
+                    for it in items {
+                        let rname = it.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let full = it.get("full_name").and_then(|v| v.as_str()).unwrap_or("");
+                        if rname.eq_ignore_ascii_case(&name_clone) && !full.is_empty() {
+                            matches.push(full.to_string());
+                            if matches.len() >= 3 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        (in_owner, matches)
+    })
+    .await
+    .unwrap_or((false, Vec::new()));
+
+    Json(serde_json::json!({
+        "ok": true,
+        "valid": true,
+        "name": name,
+        "owner": owner,
+        "exists_local": exists_local,
+        "exists_in_owner": exists_in_owner,
+        "exact_public_matches": exact_public_matches,
+    }))
+}
+
 #[derive(Deserialize)]
 struct RepoInitReq {
     name: String,
+    display_name: Option<String>,
+    template_id: Option<String>,
+    license: Option<String>,
+    local_only: Option<bool>,
     workspace_path: Option<String>,
     private: Option<bool>,
     vcs_mode: Option<String>,
     /// If provided (interactive owner mode), unlocks Admin Vault immediately and creates repo on GitHub right now
     unlock_mode: Option<String>, // "agent_queue" | "pin" | "os_bio"
     pin: Option<String>,
+}
+
+async fn api_templates_list(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let list = crate::templates::list_templates(&state.base_dir);
+    Json(serde_json::json!({
+        "ok": true,
+        "templates": list,
+        "templates_dir": crate::templates::templates_root(&state.base_dir).to_string_lossy()
+    }))
+}
+
+#[derive(Deserialize)]
+struct SaveTemplateReq {
+    id: String,
+    name: String,
+    description: Option<String>,
+    files: HashMap<String, String>,
+}
+
+async fn api_templates_save(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SaveTemplateReq>,
+) -> Response {
+    match crate::templates::save_custom_template(
+        &state.base_dir,
+        &req.id,
+        &req.name,
+        &req.description.unwrap_or_default(),
+        req.files,
+    ) {
+        Ok(tpl) => Json(serde_json::json!({ "ok": true, "template": tpl })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_templates_delete(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    match crate::templates::delete_template(&state.base_dir, &id) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn api_repo_init(
@@ -645,16 +889,25 @@ async fn api_repo_init(
         _ => None,
     };
 
+    let display_name = req.display_name.unwrap_or_default();
+    let template_id = req.template_id.unwrap_or_else(|| "empty".to_string());
+    let license = req.license.unwrap_or_else(|| "MIT".to_string());
+    let local_only = req.local_only.unwrap_or(false);
+
     match initialize_managed_repository(
         &state.base_dir,
         &state.store,
         &req.name,
+        &display_name,
+        &template_id,
+        &license,
         &wcfg.github_username,
         &ws_path,
         private,
         &vcs_mode,
         state.port,
         admin_secret_opt.as_ref(),
+        local_only,
     )
     .await
     {
