@@ -298,13 +298,13 @@ async fn git_receive_pack(
             .unwrap_or_else(|| ZERO_SHA.to_string());
 
         // If the agent pushed commits to a protected branch (e.g. main), we still want to capture
-        // the packfile objects into a parked staging ref (`refs/olorin/pending/<timestamp>`) so the human
+        // the packfile objects into a parked staging ref (`refs/olorin/parked-<sha>`) so the human
         // can inspect the diff and approve it with 1 fingerprint without the agent losing its commits!
         let mut parked_branch = first_ref.clone();
         if matches!(pre_eval.verdict, PushVerdictKind::BlockedProtectedBranch { .. })
             && new_sha != ZERO_SHA
         {
-            parked_branch = format!("refs/heads/olorin-parked-{}", &new_sha[..7.min(new_sha.len())]);
+            parked_branch = format!("refs/olorin/parked-{}", &new_sha[..7.min(new_sha.len())]);
             let rewritten_body = rewrite_first_ref_in_receive_pack(&body, &first_ref, &parked_branch);
             if let Some(mod_body) = rewritten_body {
                 let _ = run_git_receive_pack_bytes(&bare_path, &mod_body, true);
@@ -404,7 +404,7 @@ async fn git_receive_pack(
         // the objects are preserved inside the bare staging repo!
         let mut parked_branch = first_ref.clone();
         if new_sha != ZERO_SHA {
-            parked_branch = format!("refs/heads/olorin-force-{}", &new_sha[..7.min(new_sha.len())]);
+            parked_branch = format!("refs/olorin/force-{}", &new_sha[..7.min(new_sha.len())]);
             if let Some(mod_body) = rewrite_first_ref_in_receive_pack(&body, &first_ref, &parked_branch) {
                 let _ = run_git_receive_pack_bytes(&bare_path, &mod_body, true);
             }
@@ -531,7 +531,7 @@ fn run_git_receive_pack_bytes(
 }
 
 /// Rewrites the first pkt-line ref target in a `git-receive-pack` stream so we can park
-/// an intercepted push to `refs/heads/main` into `refs/heads/olorin-parked-<sha>` safely.
+/// an intercepted push to `refs/heads/main` into `refs/olorin/parked-<sha>` safely.
 fn rewrite_first_ref_in_receive_pack(
     body: &[u8],
     old_ref: &str,
@@ -1024,6 +1024,11 @@ async fn api_queue_reject(
         .set_item_status(id, QueueItemStatus::Rejected, None)
     {
         Ok(Some(item)) => {
+            let bare_path = state
+                .store
+                .staging_dir
+                .join(format!("{}.git", item.repo_name));
+            crate::github::cleanup_parked_ref(&bare_path, &item.source_branch);
             state.store.add_audit(
                 &item.repo_name,
                 "human-owner",

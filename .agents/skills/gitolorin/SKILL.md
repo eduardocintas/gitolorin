@@ -22,6 +22,7 @@ Repositories governed by `gitOlorin` route `origin` through the local security p
 - **`jj` is the primary VCS.** Use `jj status`, `jj log`, `jj diff`, `jj describe -m "..."`, and `jj new` for all checkpoints, atomic changes, and verification gates.
 - If `jj` is not on `$PATH`, `gitOlorin` installs it at `~/.gitolorin/bin/jj` and symlinks `~/.local/bin/jj`.
 - **NEVER use `git add`, `git commit`, or `git status` as workflow or gate checks** in a `jj` colocated repo (doing so breaks the expected `jj` working-copy & bookmark model).
+- **NEVER rewrite a commit already pushed to a remote bookmark** (no `jj describe`, `jj squash`, or `jj rebase` on pushed commits); always create a new change on top with `jj new` so pushes stay fast-forward.
 - Every working-tree edit is automatically tracked as a snapshot (no `git add` required).
 - If an experiment goes wrong, roll back atomically with `jj undo` or `jj op restore`.
 - Describe your change, advance to a new working-copy change, and push a feature bookmark:

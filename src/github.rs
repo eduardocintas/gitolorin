@@ -474,6 +474,20 @@ pub fn sync_bare_branch_to_github(
     Ok(())
 }
 
+pub fn cleanup_parked_ref(bare_path: &Path, ref_name: &str) {
+    if bare_path.is_dir()
+        && (ref_name.starts_with("refs/olorin/")
+            || ref_name.starts_with("refs/heads/olorin-parked-")
+            || ref_name.starts_with("refs/heads/olorin-force-"))
+    {
+        let _ = Command::new("git")
+            .arg("--git-dir")
+            .arg(bare_path)
+            .args(["update-ref", "-d", ref_name])
+            .status();
+    }
+}
+
 /// Executes a single approved QueueItem using the unlocked `AdminSecret`.
 pub async fn execute_approved_queue_item(
     store: &StateStore,
@@ -508,6 +522,9 @@ pub async fn execute_approved_queue_item(
             }
             store.mark_repo_synced(&item.repo_name, gh_url.clone())?;
             store.set_item_status(item.id, QueueItemStatus::Executed, None)?;
+            if item.kind == QueueItemKind::ProtectedBranchPush {
+                cleanup_parked_ref(&bare_path, &item.source_branch);
+            }
             let msg = format!("Repo '{}' creado en GitHub ({}) y todas las ramas sincronizadas.", item.repo_name, gh_url);
             store.add_audit(&item.repo_name, "human-biometric", "approve_create_repo", true, &msg);
             Ok(msg)
@@ -627,6 +644,9 @@ pub async fn execute_approved_queue_item(
             }
 
             store.set_item_status(item.id, QueueItemStatus::Executed, None)?;
+            if item.kind == QueueItemKind::ProtectedBranchPush {
+                cleanup_parked_ref(&bare_path, &item.source_branch);
+            }
             let msg = format!(
                 "MR #{} fusionado en '{}' (commit {}) y sincronizado.",
                 item.id,
@@ -659,6 +679,7 @@ pub async fn execute_approved_queue_item(
             }
 
             store.set_item_status(item.id, QueueItemStatus::Executed, None)?;
+            cleanup_parked_ref(&bare_path, &item.source_branch);
             let msg = format!(
                 "Operación destructiva #{} aprobada y aplicada sobre '{}'.",
                 item.id, target_ref
