@@ -150,6 +150,7 @@ async fn main() -> Result<()> {
     let base_dir = resolve_base_dir(cli.data_dir);
     let _ = templates::ensure_builtin_templates(&base_dir);
     let _ = vcs::ensure_gitolorin_skill_installed();
+    vcs::ensure_jj_symlink(&base_dir);
     let vault = VaultManager::new(base_dir.clone())?;
     let store = StateStore::new(base_dir.clone())?;
 

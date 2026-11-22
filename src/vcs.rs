@@ -42,11 +42,33 @@ pub fn check_vcs_tools(base_dir: &Path) -> VcsToolStatus {
     }
 }
 
+pub fn ensure_jj_symlink(base_dir: &Path) {
+    #[cfg(unix)]
+    {
+        let local_jj = base_dir.join("bin/jj");
+        if local_jj.is_file() {
+            if let Some(home) = dirs::home_dir() {
+                let user_bin = home.join(".local/bin");
+                let link_path = user_bin.join("jj");
+                if link_path.symlink_metadata().is_err() {
+                    let _ = fs::create_dir_all(&user_bin);
+                    let _ = std::os::unix::fs::symlink(&local_jj, &link_path);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = base_dir;
+    }
+}
+
 /// Automatically downloads the official precompiled `jj` (Jujutsu) binary for the current OS/arch
 /// into `~/.gitolorin/bin/jj` if it is not already installed on the machine.
 pub async fn ensure_jj_installed(base_dir: &Path) -> Result<PathBuf> {
     let status = check_vcs_tools(base_dir);
     if let Some(existing) = status.jj_path {
+        ensure_jj_symlink(base_dir);
         return Ok(PathBuf::from(existing));
     }
 
@@ -106,6 +128,7 @@ pub async fn ensure_jj_installed(base_dir: &Path) -> Result<PathBuf> {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&jj_bin, fs::Permissions::from_mode(0o755));
     }
+    ensure_jj_symlink(base_dir);
 
     Ok(jj_bin)
 }
@@ -132,6 +155,7 @@ Repositories governed by `gitOlorin` route `origin` through the local security p
 
 ### 1. Jujutsu (`jj` colocated with Git)
 - **`jj` is the primary VCS.** Use `jj status`, `jj log`, `jj diff`, `jj describe -m "..."`, and `jj new` for all checkpoints, atomic changes, and verification gates.
+- If `jj` is not on `$PATH`, `gitOlorin` installs it at `~/.gitolorin/bin/jj` and symlinks `~/.local/bin/jj`.
 - **NEVER use `git add`, `git commit`, or `git status` as workflow or gate checks** in a `jj` colocated repo (doing so breaks the expected `jj` working-copy & bookmark model).
 - Every working-tree edit is automatically tracked as a snapshot (no `git add` required).
 - If an experiment goes wrong, roll back atomically with `jj undo` or `jj op restore`.
@@ -141,7 +165,7 @@ Repositories governed by `gitOlorin` route `origin` through the local security p
   jj describe -m "feat: concise summary"
   jj new
   jj bookmark set feat/<task> -r @-
-  jj git push --bookmark feat/<task> --allow-new
+  jj git push --bookmark feat/<task>
   ```
 
 ### 2. Git Worktrees (`worktree`)
