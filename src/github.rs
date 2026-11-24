@@ -1,16 +1,198 @@
 use crate::inspector::{
-     compute_bare_diff_summary, install_staging_pre_receive_hook,
+    compute_bare_diff_summary, install_staging_pre_receive_hook,
 };
 use crate::queue::{ManagedRepo, QueueItem, QueueItemKind, QueueItemStatus, StateStore};
 use crate::vault::AdminSecret;
 use crate::vcs::{ensure_jj_installed, inject_agents_md};
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chrono::Utc;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use zeroize::Zeroize;
+
+pub fn validate_repo_name(raw: &str) -> Result<String> {
+    let clean = raw.trim();
+    if clean.is_empty()
+        || clean.len() > 100
+        || clean.starts_with('-')
+        || clean.starts_with('.')
+        || clean.contains("..")
+        || !clean
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(anyhow!(
+            "Nombre de repositorio inválido '{}'. Usa solo letras, números, guiones o puntos (sin empezar con '-' o '.', ni '..').",
+            clean
+        ));
+    }
+    Ok(clean.to_string())
+}
+
+pub fn validate_github_https_url(raw: &str) -> Result<()> {
+    const PREFIX: &str = "https://github.com/";
+    if !raw.starts_with(PREFIX)
+        || raw.chars().any(|c| c.is_whitespace() || c.is_control())
+        || raw.contains('@')
+        || raw.contains('?')
+        || raw.contains('#')
+        || raw.contains("..")
+    {
+        return Err(anyhow!(
+            "URL de GitHub inválida o potencialmente insegura: solo se permite https://github.com/<owner>/<repo>[.git]"
+        ));
+    }
+
+    let rest = &raw[PREFIX.len()..];
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.len() != 2 {
+        return Err(anyhow!(
+            "URL de GitHub inválida: debe tener exactamente formato https://github.com/<owner>/<repo>"
+        ));
+    }
+
+    let owner = parts[0];
+    let repo_part = parts[1];
+    if owner.is_empty()
+        || owner.starts_with('-')
+        || owner.starts_with('.')
+        || !owner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(anyhow!("Propietario inválido en URL de GitHub."));
+    }
+
+    let repo_clean = repo_part.strip_suffix(".git").unwrap_or(repo_part);
+    validate_repo_name(repo_clean)?;
+    Ok(())
+}
+
+pub fn validate_token_for_header(token: &str) -> Result<&str> {
+    let clean = token.trim();
+    if clean.is_empty()
+        || clean.contains('\r')
+        || clean.contains('\n')
+        || clean.contains('\0')
+        || clean.contains('"')
+        || clean.contains('\\')
+        || clean.chars().any(|c| c.is_control())
+    {
+        return Err(anyhow!(
+            "El token contiene caracteres inválidos para cabecera HTTP."
+        ));
+    }
+    Ok(clean)
+}
+
+pub fn redact_secret(text: &str, token: &str) -> String {
+    let clean = token.trim();
+    if clean.is_empty() {
+        return text.to_string();
+    }
+    let mut out = text.replace(clean, "[REDACTED]");
+    let mut raw_basic = format!("x-access-token:{}", clean);
+    let mut b64 = B64.encode(raw_basic.as_bytes());
+    out = out.replace(&b64, "[REDACTED]");
+    raw_basic.zeroize();
+    b64.zeroize();
+    out
+}
+
+fn run_github_api_curl(
+    method: &str,
+    url: &str,
+    token: &str,
+    json_body: Option<&str>,
+) -> Result<Vec<u8>> {
+    if !url.starts_with("https://api.github.com/") {
+        return Err(anyhow!("URL de API GitHub no permitida."));
+    }
+    let clean_token = validate_token_for_header(token)?;
+
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "-sS",
+        "-X",
+        method,
+        url,
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "X-GitHub-Api-Version: 2022-11-28",
+        "-H",
+        "User-Agent: gitolorin/0.1.0",
+        "--config",
+        "-",
+    ]);
+    if let Some(body) = json_body {
+        cmd.args(["-d", body]);
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Ejecutando curl hacia GitHub API")?;
+
+    let mut cfg = format!("header = \"Authorization: Bearer {}\"\n", clean_token);
+    if let Some(mut stdin) = child.stdin.take() {
+        let wres = stdin.write_all(cfg.as_bytes());
+        cfg.zeroize();
+        wres.context("Enviando cabecera de autorización por stdin a curl")?;
+    } else {
+        cfg.zeroize();
+    }
+
+    let out = child
+        .wait_with_output()
+        .context("Esperando respuesta de GitHub API")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow!(
+            "Error llamando a GitHub API: {}",
+            redact_secret(stderr.trim(), clean_token)
+        ));
+    }
+    Ok(out.stdout)
+}
+
+fn run_git_with_github_auth(
+    git_dir: Option<&Path>,
+    cwd: Option<&Path>,
+    args: &[&str],
+    token: &str,
+) -> Result<std::process::Output> {
+    let clean_token = validate_token_for_header(token)?;
+    let mut raw = format!("x-access-token:{}", clean_token);
+    let mut basic = B64.encode(raw.as_bytes());
+    let mut auth_header = format!("AUTHORIZATION: basic {}", basic);
+
+    let mut cmd = Command::new("git");
+    if let Some(gd) = git_dir {
+        cmd.arg("--git-dir").arg(gd);
+    }
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+        .env("GIT_CONFIG_VALUE_0", &auth_header);
+
+    let res = cmd.output();
+    raw.zeroize();
+    basic.zeroize();
+    auth_header.zeroize();
+
+    res.context("Ejecutando comando git autenticado hacia GitHub")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitRepoResult {
@@ -42,17 +224,8 @@ pub async fn initialize_managed_repository(
     admin_secret: Option<&AdminSecret>,
     local_only: bool,
 ) -> Result<InitRepoResult> {
-    let clean_name = repo_name.trim();
-    if clean_name.is_empty()
-        || !clean_name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-    {
-        return Err(anyhow!(
-            "Nombre de repositorio inválido '{}'. Usa solo letras, números, guiones o puntos.",
-            clean_name
-        ));
-    }
+    let clean_name_buf = validate_repo_name(repo_name)?;
+    let clean_name = clean_name_buf.as_str();
 
     // 1. Create the bare staging repository inside ~/.gitolorin/staging/<name>.git
     let bare_path = store.staging_dir.join(format!("{}.git", clean_name));
@@ -386,27 +559,14 @@ pub async fn create_github_repo_api(
     })
     .to_string();
 
-    let out = Command::new("curl")
-        .args([
-            "-sS",
-            "-X",
-            "POST",
-            "https://api.github.com/user/repos",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            &format!("Authorization: Bearer {}", secret.admin_pat.trim()),
-            "-H",
-            "X-GitHub-Api-Version: 2022-11-28",
-            "-H",
-            "User-Agent: gitolorin/0.1.0",
-            "-d",
-            &payload,
-        ])
-        .output()
-        .context("Llamando a GitHub API POST /user/repos")?;
+    let stdout = run_github_api_curl(
+        "POST",
+        "https://api.github.com/user/repos",
+        &secret.admin_pat,
+        Some(&payload),
+    )?;
 
-    let body: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let body: serde_json::Value = serde_json::from_slice(&stdout).unwrap_or_default();
 
     if let Some(html_url) = body.get("html_url").and_then(|v| v.as_str()) {
         return Ok(html_url.to_string());
@@ -425,12 +585,12 @@ pub async fn create_github_repo_api(
 
     Err(anyhow!(
         "GitHub API rechazó la creación del repo: {}",
-        err_msg
+        redact_secret(err_msg, &secret.admin_pat)
     ))
 }
 
-/// Pushes a specific branch from our local bare staging repository to GitHub using an ephemeral
-/// in-memory HTTP extraheader so the token is never written to `.git/config` or disk.
+/// Pushes a specific branch from our local bare staging repository to GitHub using GIT_CONFIG_*
+/// environment variables scoped strictly to `https://github.com/` (never passed in argv or written to disk).
 pub fn sync_bare_branch_to_github(
     bare_repo_path: &Path,
     github_user: &str,
@@ -443,10 +603,8 @@ pub fn sync_bare_branch_to_github(
         return Ok(());
     }
 
-    use base64::{engine::general_purpose::STANDARD as B64, Engine};
-    let basic = B64.encode(format!("x-access-token:{}", token.trim()));
-    let auth_header = format!("AUTHORIZATION: basic {}", basic);
     let remote_url = format!("https://github.com/{}/{}.git", github_user, repo_name);
+    validate_github_https_url(&remote_url)?;
 
     let refspec = if branch_or_refspec.contains(':') || branch_or_refspec.starts_with("refs/") {
         branch_or_refspec.to_string()
@@ -454,22 +612,19 @@ pub fn sync_bare_branch_to_github(
         format!("refs/heads/{}:refs/heads/{}", branch_or_refspec, branch_or_refspec)
     };
 
-    let out = Command::new("git")
-        .arg("--git-dir")
-        .arg(bare_repo_path)
-        .args([
-            "-c",
-            &format!("http.extraheader={}", auth_header),
-            "push",
-            &remote_url,
-            &refspec,
-        ])
-        .output()
-        .context("Sincronizando rama desde bare staging a GitHub")?;
+    let out = run_git_with_github_auth(
+        Some(bare_repo_path),
+        None,
+        &["push", "--", &remote_url, &refspec],
+        token,
+    )?;
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(anyhow!("Error empujando a GitHub: {}", stderr.trim()));
+        return Err(anyhow!(
+            "Error empujando a GitHub: {}",
+            redact_secret(stderr.trim(), token)
+        ));
     }
     Ok(())
 }
@@ -504,21 +659,24 @@ pub async fn execute_approved_queue_item(
             let gh_url = create_github_repo_api(secret, &item.repo_name, &repo.display_name, item.private_repo).await?;
             // Sync all existing branches from local bare staging to GitHub
             if !secret.admin_pat.trim().starts_with("demo_") && secret.admin_pat.trim() != "local_only" {
-                use base64::{engine::general_purpose::STANDARD as B64, Engine};
-                let basic = B64.encode(format!("x-access-token:{}", secret.admin_pat.trim()));
-                let auth_header = format!("AUTHORIZATION: basic {}", basic);
-                let remote_url = format!("https://github.com/{}/{}.git", secret.github_username, item.repo_name);
-                let _ = Command::new("git")
-                    .arg("--git-dir")
-                    .arg(&bare_path)
-                    .args([
-                        "-c",
-                        &format!("http.extraheader={}", auth_header),
-                        "push",
-                        "--all",
-                        &remote_url,
-                    ])
-                    .output();
+                let remote_url = format!(
+                    "https://github.com/{}/{}.git",
+                    secret.github_username, item.repo_name
+                );
+                validate_github_https_url(&remote_url)?;
+                let push_out = run_git_with_github_auth(
+                    Some(&bare_path),
+                    None,
+                    &["push", "--all", "--", &remote_url],
+                    &secret.admin_pat,
+                )?;
+                if !push_out.status.success() {
+                    let stderr = String::from_utf8_lossy(&push_out.stderr);
+                    return Err(anyhow!(
+                        "Repo creado en GitHub, pero falló la sincronización de ramas: {}",
+                        redact_secret(stderr.trim(), &secret.admin_pat)
+                    ));
+                }
             }
             store.mark_repo_synced(&item.repo_name, gh_url.clone())?;
             store.set_item_status(item.id, QueueItemStatus::Executed, None)?;
@@ -687,5 +845,323 @@ pub async fn execute_approved_queue_item(
             store.add_audit(&item.repo_name, "human-biometric", "approve_destructive_op", true, &msg);
             Ok(msg)
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteGithubRepo {
+    pub name: String,
+    pub full_name: String,
+    pub description: Option<String>,
+    pub private: bool,
+    pub html_url: String,
+    pub clone_url: String,
+    pub default_branch: String,
+    pub updated_at: String,
+    pub language: Option<String>,
+    pub fork: bool,
+    pub cloned_paths: Vec<String>,
+    pub managed_by_gitolorin: bool,
+    pub managed_workspace_path: Option<String>,
+}
+
+fn find_local_clone_paths(repo_name: &str, managed: Option<&ManagedRepo>) -> Vec<String> {
+    let mut paths = Vec::new();
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let candidates = [
+        home.join("git").join(repo_name),
+        home.join("git").join("pub").join(repo_name),
+    ];
+    for c in candidates {
+        if c.join(".git").exists() {
+            paths.push(c.to_string_lossy().to_string());
+        }
+    }
+    if let Some(m) = managed {
+        let mp = PathBuf::from(&m.local_workspace_path);
+        if mp.join(".git").exists() {
+            let s = mp.to_string_lossy().to_string();
+            if !paths.contains(&s) {
+                paths.push(s);
+            }
+        }
+    }
+    paths
+}
+
+/// Lists remote repositories owned by the authenticated GitHub user and enriches them
+/// with local clone tracking (`~/git/<name>`, `~/git/pub/<name>`, and gitOlorin managed repos).
+pub async fn list_github_repos_api(
+    secret: &AdminSecret,
+    store: &StateStore,
+) -> Result<Vec<RemoteGithubRepo>> {
+    if secret.admin_pat.trim().starts_with("demo_") || secret.admin_pat.trim() == "local_only" {
+        return Err(anyhow!(
+            "La bóveda está en modo demo/local; configura un GitHub PAT real para listar repositorios remotos."
+        ));
+    }
+
+    let stdout = run_github_api_curl(
+        "GET",
+        "https://api.github.com/user/repos?per_page=100&sort=updated&affiliation=owner",
+        &secret.admin_pat,
+        None,
+    )?;
+
+    let val: serde_json::Value = serde_json::from_slice(&stdout)
+        .context("Parseando respuesta JSON de GitHub API /user/repos")?;
+
+    let arr = match val.as_array() {
+        Some(a) => a,
+        None => {
+            let err_msg = val
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Respuesta inesperada de GitHub API");
+            return Err(anyhow!(
+                "GitHub API error: {}",
+                redact_secret(err_msg, &secret.admin_pat)
+            ));
+        }
+    };
+
+    let mut repos = Vec::with_capacity(arr.len());
+    for item in arr {
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let managed = store.get_repo(&name);
+        let cloned_paths = find_local_clone_paths(&name, managed.as_ref());
+        repos.push(RemoteGithubRepo {
+            name: name.clone(),
+            full_name: item
+                .get("full_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&name)
+                .to_string(),
+            description: item
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            private: item.get("private").and_then(|v| v.as_bool()).unwrap_or(false),
+            html_url: item
+                .get("html_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            clone_url: item
+                .get("clone_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            default_branch: item
+                .get("default_branch")
+                .and_then(|v| v.as_str())
+                .unwrap_or("main")
+                .to_string(),
+            updated_at: item
+                .get("updated_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            language: item
+                .get("language")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            fork: item.get("fork").and_then(|v| v.as_bool()).unwrap_or(false),
+            cloned_paths,
+            managed_by_gitolorin: managed.is_some(),
+            managed_workspace_path: managed.map(|m| m.local_workspace_path),
+        });
+    }
+
+    Ok(repos)
+}
+
+/// Clones a remote GitHub repository into `~/git/<name>` or `~/git/pub/<name>`,
+/// sets up the local bare staging mirror, points `origin` through the gitOlorin proxy,
+/// injects `AGENTS.md`, and optionally initializes `jj --colocate`.
+pub async fn clone_github_repo(
+    store: &StateStore,
+    secret: &AdminSecret,
+    repo_name: &str,
+    clone_url: &str,
+    html_url: &str,
+    target_group: &str,
+    private: bool,
+    vcs_mode: &str,
+    proxy_port: u16,
+) -> Result<ManagedRepo> {
+    let clean_name_buf = validate_repo_name(repo_name)?;
+    let clean_name = clean_name_buf.as_str();
+    validate_github_https_url(clone_url)?;
+    if !html_url.trim().is_empty() {
+        validate_github_https_url(html_url)?;
+    }
+
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let target_parent = match target_group {
+        "git" => home.join("git"),
+        "git/pub" => home.join("git").join("pub"),
+        _ => return Err(anyhow!("Destino inválido '{}'. Usa 'git' o 'git/pub'.", target_group)),
+    };
+    fs::create_dir_all(&target_parent)?;
+    let workspace_dir = target_parent.join(&clean_name);
+    if workspace_dir.exists() {
+        return Err(anyhow!(
+            "El directorio '{}' ya existe localmente.",
+            workspace_dir.display()
+        ));
+    }
+
+    let workspace_dir_str = workspace_dir.to_string_lossy().to_string();
+    let clone_out = run_git_with_github_auth(
+        None,
+        None,
+        &["clone", "--", clone_url, &workspace_dir_str],
+        &secret.admin_pat,
+    )?;
+
+    if !clone_out.status.success() {
+        let stderr = String::from_utf8_lossy(&clone_out.stderr);
+        return Err(anyhow!(
+            "Error clonando desde GitHub: {}",
+            redact_secret(stderr.trim(), &secret.admin_pat)
+        ));
+    }
+
+    // Create or reuse bare staging repo in ~/.gitolorin/staging/<name>.git
+    let bare_path = store.staging_dir.join(format!("{}.git", clean_name));
+    if !bare_path.is_dir() {
+        fs::create_dir_all(&bare_path)?;
+        let st = Command::new("git")
+            .args(["clone", "--bare"])
+            .arg(&workspace_dir)
+            .arg(&bare_path)
+            .status()
+            .context("Creando espejo bare de staging")?;
+        if !st.success() {
+            return Err(anyhow!("Error creando repositorio bare de staging"));
+        }
+        let _ = Command::new("git")
+            .arg("--git-dir")
+            .arg(&bare_path)
+            .args(["config", "http.receivepack", "true"])
+            .status();
+        install_staging_pre_receive_hook(&bare_path)?;
+    }
+
+    let project_token = store
+        .get_repo(&clean_name)
+        .map(|r| r.project_proxy_token)
+        .unwrap_or_else(|| {
+            let mut b = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut b);
+            format!("olo_{}", hex::encode(b))
+        });
+
+    // Point workspace origin to gitOlorin proxy with per-project proxy token (clean URL goes in AGENTS.md)
+    let authed_proxy_origin = format!(
+        "http://x-olorin:{}@127.0.0.1:{}/git/{}.git",
+        project_token, proxy_port, clean_name
+    );
+    let clean_proxy_origin = format!("http://127.0.0.1:{}/git/{}.git", proxy_port, clean_name);
+    let _ = Command::new("git")
+        .args(["remote", "set-url", "origin", &authed_proxy_origin])
+        .current_dir(&workspace_dir)
+        .status();
+
+    // Inject AGENTS.md & optional jj colocate
+    let _ = inject_agents_md(&workspace_dir, clean_name, vcs_mode, &clean_proxy_origin);
+    if vcs_mode == "jj" {
+        let base_dir = store.staging_dir.parent().unwrap_or(&store.staging_dir);
+        if let Ok(jj_bin) = ensure_jj_installed(base_dir).await {
+            let _ = Command::new(jj_bin)
+                .args(["git", "init", "--colocate"])
+                .current_dir(&workspace_dir)
+                .status();
+        }
+    }
+
+    let managed = ManagedRepo {
+        name: clean_name.to_string(),
+        display_name: String::new(),
+        template_id: String::new(),
+        owner: secret.github_username.clone(),
+        local_workspace_path: workspace_dir.to_string_lossy().to_string(),
+        bare_staging_path: bare_path.to_string_lossy().to_string(),
+        github_synced: true,
+        github_url: Some(html_url.to_string()),
+        private,
+        vcs_mode: vcs_mode.to_string(),
+        project_proxy_token: project_token,
+        created_at: Utc::now().to_rfc3339(),
+    };
+
+    store.upsert_repo(managed.clone())?;
+    store.add_audit(
+        clean_name,
+        "human-owner",
+        "clone_github_repo",
+        true,
+        &format!("Clonado desde GitHub en {}", workspace_dir.display()),
+    );
+
+    Ok(managed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_github_https_url() {
+        assert!(validate_github_https_url("https://github.com/octocat/hello-world.git").is_ok());
+        assert!(validate_github_https_url("https://github.com/octocat/repo_1.2").is_ok());
+
+        // Reject evil domains, userinfo tricks, http, flag injection, queries, traversal, control chars
+        assert!(validate_github_https_url("https://evil.com/octocat/repo.git").is_err());
+        assert!(validate_github_https_url("https://github.com@evil.com/octocat/repo.git").is_err());
+        assert!(validate_github_https_url("http://github.com/octocat/repo.git").is_err());
+        assert!(validate_github_https_url("--upload-pack=evil").is_err());
+        assert!(validate_github_https_url("https://github.com/octocat/repo.git?x=1").is_err());
+        assert!(validate_github_https_url("https://github.com/octocat/repo.git#frag").is_err());
+        assert!(validate_github_https_url("https://github.com/octocat/../evil").is_err());
+        assert!(validate_github_https_url("https://github.com/octocat/repo\n").is_err());
+        assert!(validate_github_https_url("https://github.com/octocat").is_err());
+        assert!(validate_github_https_url("https://github.com/octocat/repo/extra").is_err());
+    }
+
+    #[test]
+    fn test_validate_repo_name() {
+        assert_eq!(validate_repo_name(" gitolorin ").unwrap(), "gitolorin");
+        assert!(validate_repo_name("my-repo_01.rs").is_ok());
+        assert!(validate_repo_name("").is_err());
+        assert!(validate_repo_name("-leading-dash").is_err());
+        assert!(validate_repo_name(".hidden").is_err());
+        assert!(validate_repo_name("foo..bar").is_err());
+        assert!(validate_repo_name("foo/bar").is_err());
+        assert!(validate_repo_name(&"a".repeat(101)).is_err());
+    }
+
+    #[test]
+    fn test_redact_secret_and_validate_token() {
+        let tok = "ghp_ExampleSecretToken123456";
+        assert_eq!(validate_token_for_header("  ghp_abc123  ").unwrap(), "ghp_abc123");
+        assert!(validate_token_for_header("").is_err());
+        assert!(validate_token_for_header("ghp_bad\nheader").is_err());
+        assert!(validate_token_for_header("ghp_bad\"quote").is_err());
+
+        let b64 = B64.encode(format!("x-access-token:{}", tok));
+        let msg = format!("fatal: auth failed for {} / basic {}", tok, b64);
+        let cleaned = redact_secret(&msg, tok);
+        assert!(!cleaned.contains(tok));
+        assert!(!cleaned.contains(&b64));
+        assert!(cleaned.contains("[REDACTED]"));
     }
 }

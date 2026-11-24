@@ -47,8 +47,11 @@ pub fn is_autostart_enabled() -> bool {
 }
 
 pub fn set_autostart(enabled: bool) -> Result<String> {
-    let exe_path = std::env::current_exe()
-        .unwrap_or_else(|_| PathBuf::from("/home/edu/.local/bin/gitolorin"));
+    let exe_path = std::env::current_exe().unwrap_or_else(|_| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".local/bin/gitolorin")
+    });
 
     #[cfg(target_os = "linux")]
     {

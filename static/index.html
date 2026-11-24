@@ -35,6 +35,9 @@
       <button class="tab-btn" data-tab="repos">
         📦 Repositorios &amp; Crear Repo <span id="badge-repos-count" class="tab-count">0</span>
       </button>
+      <button class="tab-btn" data-tab="github">
+        🐙 GitHub Remoto <span id="badge-github-count" class="tab-count">0</span>
+      </button>
       <button class="tab-btn" data-tab="vault">
         🔐 Bóveda Biométrica &amp; Llaves
       </button>
@@ -104,7 +107,7 @@
             </div>
             <div class="form-group">
               <label>Directorio Local (Workspace)</label>
-              <input type="text" id="inp-repo-path" placeholder="/home/edu/git/pub/mi-nuevo-proyecto" />
+              <input type="text" id="inp-repo-path" placeholder="~/git/pub/mi-nuevo-proyecto" />
             </div>
             <div class="form-row">
               <div class="form-group">
@@ -149,6 +152,38 @@
       </div>
     </main>
 
+    <!-- TAB: GITHUB REMOTO -->
+    <main id="tab-github" class="tab-panel">
+      <section class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:14px;">
+          <div>
+            <h3 style="margin-bottom:4px;">🐙 Repositorios Remotos en GitHub</h3>
+            <p class="muted" style="margin:0;">Lista tus repositorios de GitHub, detecta si ya están clonados en <code>~/git</code> o <code>~/git/pub</code>, y clónalos bajo protección de gitOlorin.</p>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <select id="sel-gh-auth" onchange="toggleGhPinInput()" style="width:auto;">
+              <option value="os_bio" selected>🔐 Huella / Polkit</option>
+              <option value="pin">🔑 PIN de Bóveda</option>
+            </select>
+            <input type="password" id="inp-gh-pin" class="hidden" placeholder="PIN de bóveda" style="width:140px;" />
+            <button type="button" class="btn btn-primary" onclick="fetchGithubRepos()">🔄 Listar Repos de GitHub</button>
+          </div>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+          <input type="text" id="inp-gh-search" placeholder="Buscar repositorio..." oninput="renderGithubRepos()" style="flex:1;min-width:200px;" />
+          <select id="sel-gh-filter" onchange="renderGithubRepos()" style="width:auto;">
+            <option value="all">Todos</option>
+            <option value="uncloned">Solo no clonados</option>
+            <option value="cloned">Solo clonados localmente</option>
+          </select>
+        </div>
+        <div id="github-feedback" class="feedback-box hidden"></div>
+        <div id="github-repos-list" class="repos-container">
+          <div class="empty-state">Haz clic en "🔄 Listar Repos de GitHub" para consultar tu cuenta.</div>
+        </div>
+      </section>
+    </main>
+
     <!-- TAB 3: BÓVEDA BIOMÉTRICA & LLAVES -->
     <main id="tab-vault" class="tab-panel">
       <div class="grid-2">
@@ -160,7 +195,7 @@
           <form id="form-vault-setup" onsubmit="handleVaultSetup(event)">
             <div class="form-group">
               <label>Usuario u Organización de GitHub</label>
-              <input type="text" id="inp-gh-user" placeholder="ej. edu" required />
+              <input type="text" id="inp-gh-user" placeholder="ej. tu-usuario" required />
             </div>
             <div class="form-group">
               <label>Credencial 1 (Alta): Admin Token (Crear repos y mergear a <code>main</code>)</label>
@@ -170,7 +205,7 @@
             <div class="form-group">
               <label>Credencial 2 (Baja - Opcional): Worker Token (Solo push a ramas <code>feat/*</code>)</label>
               <input type="password" id="inp-worker-pat" placeholder="Token limitado (el proxy bloquea main, force-push y delete)" />
-              <small>Usado automáticamente por el proxy cuando un agente hace fast-forward a ramas secundarias.</small>
+              <small>Se guarda cifrado dentro de la bóveda y solo vive en RAM mientras el daemon está activo (nunca en texto plano en disco).</small>
             </div>
             <div class="form-row">
               <div class="form-group">
@@ -195,6 +230,16 @@
                 🔑 Registrar Llave / Huella WebAuthn del Navegador (Opcional)
               </button>
               <span id="lbl-webauthn-status" class="muted-inline"></span>
+            </div>
+            <div id="grp-vault-reauth" class="form-group hidden">
+              <label>Autorizar actualización de bóveda existente</label>
+              <div class="form-row">
+                <select id="sel-vault-reauth" onchange="toggleVaultReauthPinInput()">
+                  <option value="os_bio" selected>🔐 Huella / Polkit del sistema</option>
+                  <option value="pin">🔑 PIN actual de la bóveda</option>
+                </select>
+                <input type="password" id="inp-vault-current-pin" class="hidden" placeholder="PIN actual de bóveda" />
+              </div>
             </div>
             <button type="submit" class="btn btn-primary full-w">🛡️ Encriptar y Sellar Bóveda Admin</button>
           </form>

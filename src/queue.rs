@@ -1,3 +1,4 @@
+use crate::vault::{set_dir_0700, write_file_0600};
 use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,39 @@ pub struct ManagedRepo {
     pub created_at: String,
 }
 
+#[derive(Serialize, Clone, Debug)]
+pub struct PublicManagedRepo {
+    pub name: String,
+    pub display_name: String,
+    pub template_id: String,
+    pub owner: String,
+    pub local_workspace_path: String,
+    pub bare_staging_path: String,
+    pub github_synced: bool,
+    pub github_url: Option<String>,
+    pub private: bool,
+    pub vcs_mode: String,
+    pub created_at: String,
+}
+
+impl ManagedRepo {
+    pub fn to_public(&self) -> PublicManagedRepo {
+        PublicManagedRepo {
+            name: self.name.clone(),
+            display_name: self.display_name.clone(),
+            template_id: self.template_id.clone(),
+            owner: self.owner.clone(),
+            local_workspace_path: self.local_workspace_path.clone(),
+            bare_staging_path: self.bare_staging_path.clone(),
+            github_synced: self.github_synced,
+            github_url: self.github_url.clone(),
+            private: self.private,
+            vcs_mode: self.vcs_mode.clone(),
+            created_at: self.created_at.clone(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AuditLogEntry {
     pub id: u64,
@@ -96,10 +130,18 @@ pub struct StateStore {
 
 impl StateStore {
     pub fn new(base_dir: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&base_dir)?;
+        set_dir_0700(&base_dir);
         let staging_dir = base_dir.join("staging");
         fs::create_dir_all(&staging_dir)?;
+        set_dir_0700(&staging_dir);
         let db_path = base_dir.join("state_db.json");
         let data = if db_path.is_file() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600));
+            }
             let raw = fs::read_to_string(&db_path).unwrap_or_default();
             serde_json::from_str(&raw).unwrap_or_default()
         } else {
@@ -119,7 +161,7 @@ impl StateStore {
     fn save_locked(&self, data: &StateDbData) -> Result<()> {
         let tmp = self.db_path.with_extension("json.tmp");
         let raw = serde_json::to_string_pretty(data)?;
-        fs::write(&tmp, raw)?;
+        write_file_0600(&tmp, raw.as_bytes())?;
         fs::rename(&tmp, &self.db_path)?;
         Ok(())
     }
@@ -248,5 +290,70 @@ impl StateStore {
             guard.audit_log.truncate(250);
         }
         let _ = self.save_locked(&guard);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_store_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "gitolorin_queue_test_{}_{}_{}",
+            prefix,
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    #[test]
+    fn test_public_managed_repo_redacts_proxy_token_and_permissions() {
+        let base = temp_store_dir("perms");
+        let store = StateStore::new(base.clone()).unwrap();
+
+        let repo = ManagedRepo {
+            name: "demo-repo".to_string(),
+            display_name: "Demo Repo".to_string(),
+            template_id: "empty".to_string(),
+            owner: "octocat".to_string(),
+            local_workspace_path: "/tmp/demo-repo".to_string(),
+            bare_staging_path: "/tmp/demo-repo.git".to_string(),
+            github_synced: false,
+            github_url: None,
+            private: true,
+            vcs_mode: "jj".to_string(),
+            project_proxy_token: "olo_secret_proxy_token_abcdef123456".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let public_json = serde_json::to_string(&repo.to_public()).unwrap();
+        assert!(!public_json.contains("olo_secret_proxy_token_abcdef123456"));
+        assert!(!public_json.contains("project_proxy_token"));
+        assert!(public_json.contains("demo-repo"));
+
+        store.upsert_repo(repo).unwrap();
+        assert!(store.db_path.is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let base_mode = fs::metadata(&base).unwrap().permissions().mode() & 0o777;
+            let staging_mode = fs::metadata(&store.staging_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            let db_mode = fs::metadata(&store.db_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(base_mode, 0o700);
+            assert_eq!(staging_mode, 0o700);
+            assert_eq!(db_mode, 0o600);
+        }
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

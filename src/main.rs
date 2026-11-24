@@ -15,8 +15,10 @@ use crate::queue::{QueueItemKind, QueueItemStatus, StateStore};
 use crate::vault::{AdminSecret, VaultManager};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use zeroize::Zeroize;
 
 #[derive(Parser)]
 #[command(
@@ -47,6 +49,12 @@ enum Commands {
         /// Disable the native System Tray icon
         #[arg(long)]
         no_tray: bool,
+        /// IP address to bind the server to (e.g. 127.0.0.1, a Tailscale IP, or 0.0.0.0)
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// Additional allowed Host header(s) for Web UI access (e.g. studio or studio.tailnet.ts.net)
+        #[arg(long = "allow-host")]
+        allow_hosts: Vec<String>,
     },
     /// Launch gitOlorin as a standalone frameless desktop App window (starts background daemon if needed)
     App,
@@ -73,7 +81,7 @@ enum Commands {
         /// Initialize locally without queuing a GitHub repo creation
         #[arg(long)]
         local_only: bool,
-        /// Target workspace path (defaults to current directory or /home/edu/git/pub/<name>)
+        /// Target workspace path (defaults to current directory or ~/git/pub/<name>)
         #[arg(long)]
         path: Option<PathBuf>,
         /// Version control workflow to configure in AGENTS.md ("jj", "worktree", "git")
@@ -85,20 +93,20 @@ enum Commands {
         /// Interactive owner mode: unlock Admin Vault with OS Fingerprint/Biometrics and create on GitHub immediately
         #[arg(long)]
         bio: bool,
-        /// Interactive owner mode: unlock Admin Vault with PIN and create on GitHub immediately
-        #[arg(long)]
+        /// Interactive owner mode: unlock Admin Vault with PIN (pass without value to prompt securely)
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
         pin: Option<String>,
     },
-    /// Seal or update the AES-256-GCM + Argon2id Admin Vault from CLI
+    /// Seal or update the AES-256-GCM + Argon2id Admin Vault from CLI (prompts securely when secrets are omitted)
     SetupVault {
         #[arg(long)]
         github_user: String,
         #[arg(long)]
-        admin_pat: String,
-        #[arg(long, default_value = "")]
-        worker_token: String,
+        admin_pat: Option<String>,
         #[arg(long)]
-        pin: String,
+        worker_token: Option<String>,
+        #[arg(long)]
+        pin: Option<String>,
         #[arg(long, default_value_t = true)]
         os_bio: bool,
     },
@@ -122,13 +130,87 @@ enum Commands {
         /// Use OS native fingerprint / Polkit / TouchID / Windows Hello
         #[arg(long)]
         bio: bool,
-        /// Unlock using vault PIN
-        #[arg(long)]
+        /// Unlock using vault PIN (pass without value to prompt securely)
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
         pin: Option<String>,
         /// Approve all pending items (even if not pre-marked in Web UI)
         #[arg(long)]
         all: bool,
     },
+}
+
+fn read_secret_prompt(prompt: &str, allow_empty: bool) -> Result<String> {
+    #[cfg(unix)]
+    struct EchoGuard {
+        restore: bool,
+    }
+    #[cfg(unix)]
+    impl Drop for EchoGuard {
+        fn drop(&mut self) {
+            if self.restore {
+                let _ = std::process::Command::new("stty")
+                    .arg("echo")
+                    .stdin(std::process::Stdio::inherit())
+                    .status();
+            }
+        }
+    }
+
+    eprint!("{}", prompt);
+    let _ = std::io::stderr().flush();
+
+    #[cfg(unix)]
+    let _guard = {
+        let is_tty = std::io::stdin().is_terminal();
+        let disabled = if is_tty {
+            std::process::Command::new("stty")
+                .arg("-echo")
+                .stdin(std::process::Stdio::inherit())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        EchoGuard { restore: disabled }
+    };
+
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    #[cfg(unix)]
+    if std::io::stdin().is_terminal() {
+        eprintln!();
+    }
+    let trimmed = line.trim_end_matches(&['\r', '\n'][..]).trim().to_string();
+    line.zeroize();
+    if !allow_empty && trimmed.is_empty() {
+        return Err(anyhow::anyhow!("Valor secreto requerido no proporcionado."));
+    }
+    Ok(trimmed)
+}
+
+fn resolve_cli_secret(
+    cli_opt: Option<String>,
+    env_var: &str,
+    flag_name: &str,
+    prompt: &str,
+    allow_empty: bool,
+) -> Result<String> {
+    if let Some(val) = cli_opt {
+        if !val.is_empty() {
+            eprintln!(
+                "⚠️  Advertencia: pasar {} por argumento queda visible en ps y en el historial del shell. Omite el valor o usa {}.",
+                flag_name, env_var
+            );
+            return Ok(val);
+        }
+    }
+    if let Ok(env_val) = std::env::var(env_var) {
+        if allow_empty || !env_val.trim().is_empty() {
+            return Ok(env_val);
+        }
+    }
+    read_secret_prompt(prompt, allow_empty)
 }
 
 fn resolve_base_dir(custom: Option<PathBuf>) -> PathBuf {
@@ -154,12 +236,44 @@ async fn main() -> Result<()> {
     let vault = VaultManager::new(base_dir.clone())?;
     let store = StateStore::new(base_dir.clone())?;
 
-    match cli.command.unwrap_or(Commands::Serve { open: false, no_tray: false }) {
-        Commands::Serve { open, no_tray } => {
-            let addr = format!("127.0.0.1:{}", cli.port);
+    match cli.command.unwrap_or(Commands::Serve {
+        open: false,
+        no_tray: false,
+        bind: "127.0.0.1".to_string(),
+        allow_hosts: Vec::new(),
+    }) {
+        Commands::Serve {
+            open,
+            no_tray,
+            bind,
+            mut allow_hosts,
+        } => {
+            if let Ok(env_hosts) = std::env::var("GITOLORIN_ALLOWED_HOSTS") {
+                for h in env_hosts.split(',') {
+                    let clean = h.trim();
+                    if !clean.is_empty() && !allow_hosts.iter().any(|x| x.eq_ignore_ascii_case(clean)) {
+                        allow_hosts.push(clean.to_string());
+                    }
+                }
+            }
+            let bind_trimmed = bind.trim().to_string();
+            if bind_trimmed != "127.0.0.1"
+                && bind_trimmed != "0.0.0.0"
+                && bind_trimmed != "::"
+                && !bind_trimmed.eq_ignore_ascii_case("localhost")
+                && !allow_hosts.iter().any(|x| x.eq_ignore_ascii_case(&bind_trimmed))
+            {
+                allow_hosts.push(bind_trimmed.clone());
+            }
+
+            let addr = format!("{}:{}", bind_trimmed, cli.port);
             let url = format!("http://gitolorin.localhost:{}", cli.port);
             println!("🧙‍♂️ gitOlorin v0.1.0 — Local Git Bastion & Biometric Approval Queue");
+            println!("   ├─ Escuchando en      : http://{}", addr);
             println!("   ├─ Web UI & Dashboard : {}", url);
+            if !allow_hosts.is_empty() {
+                println!("   ├─ Hosts permitidos   : {}", allow_hosts.join(", "));
+            }
             println!("   ├─ Git Smart Proxy    : http://127.0.0.1:{}/git/<repo>.git", cli.port);
             println!("   └─ Datos y Staging    : {}", base_dir.display());
 
@@ -172,6 +286,9 @@ async fn main() -> Result<()> {
                 port: cli.port,
                 vault,
                 store,
+                session_token: crate::proxy::generate_session_token(),
+                worker_token_ram: std::sync::Mutex::new(None),
+                allowed_hosts: allow_hosts,
             });
 
             if !no_tray {
@@ -188,13 +305,33 @@ async fn main() -> Result<()> {
 
             let app = build_router(state);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
-            if let Ok(v6_listener) =
-                tokio::net::TcpListener::bind(format!("[::1]:{}", cli.port)).await
-            {
-                let app_v6 = app.clone();
-                tokio::spawn(async move {
-                    let _ = axum::serve(v6_listener, app_v6).await;
-                });
+            if bind_trimmed == "127.0.0.1" {
+                if let Ok(v6_listener) =
+                    tokio::net::TcpListener::bind(format!("[::1]:{}", cli.port)).await
+                {
+                    let app_v6 = app.clone();
+                    tokio::spawn(async move {
+                        let _ = axum::serve(v6_listener, app_v6).await;
+                    });
+                }
+            } else if bind_trimmed != "0.0.0.0" && bind_trimmed != "::" {
+                // Keep 127.0.0.1 / [::1] active so local git/jj agents can push to the proxy
+                if let Ok(lo_v4) =
+                    tokio::net::TcpListener::bind(format!("127.0.0.1:{}", cli.port)).await
+                {
+                    let app_lo4 = app.clone();
+                    tokio::spawn(async move {
+                        let _ = axum::serve(lo_v4, app_lo4).await;
+                    });
+                }
+                if let Ok(lo_v6) =
+                    tokio::net::TcpListener::bind(format!("[::1]:{}", cli.port)).await
+                {
+                    let app_lo6 = app.clone();
+                    tokio::spawn(async move {
+                        let _ = axum::serve(lo_v6, app_lo6).await;
+                    });
+                }
             }
             axum::serve(listener, app).await?;
         }
@@ -271,12 +408,70 @@ async fn main() -> Result<()> {
             pin,
             os_bio,
         } => {
+            if vault.is_initialized() {
+                let v_status = vault.get_public_status();
+                let verified = if let Ok(mut cur_pin) = std::env::var("GITOLORIN_CURRENT_PIN") {
+                    let res = vault.unseal_with_pin(&cur_pin);
+                    cur_pin.zeroize();
+                    res
+                } else if v_status["os_bio_enabled"].as_bool().unwrap_or(false) {
+                    match vault.unseal_with_os_biometrics(
+                        "gitOlorin: Autorizar actualización de Bóveda Admin",
+                    ) {
+                        Ok(s) => Ok(s),
+                        Err(_) => {
+                            let mut cur_pin = read_secret_prompt(
+                                "La bóveda ya existe. Ingresa tu PIN actual para autorizar el re-sellado: ",
+                                false,
+                            )?;
+                            let res = vault.unseal_with_pin(&cur_pin);
+                            cur_pin.zeroize();
+                            res
+                        }
+                    }
+                } else {
+                    let mut cur_pin = read_secret_prompt(
+                        "La bóveda ya existe. Ingresa tu PIN actual para autorizar el re-sellado: ",
+                        false,
+                    )?;
+                    let res = vault.unseal_with_pin(&cur_pin);
+                    cur_pin.zeroize();
+                    res
+                };
+                drop(verified?);
+            }
+
+            let resolved_admin_pat = resolve_cli_secret(
+                admin_pat,
+                "GITOLORIN_ADMIN_PAT",
+                "--admin-pat",
+                "Admin PAT de GitHub (oculta): ",
+                false,
+            )?;
+            let resolved_worker_token = resolve_cli_secret(
+                worker_token,
+                "GITOLORIN_WORKER_TOKEN",
+                "--worker-token",
+                "Worker Token opcional (Enter para omitir): ",
+                true,
+            )?;
+            let mut resolved_pin = resolve_cli_secret(
+                pin,
+                "GITOLORIN_VAULT_PIN",
+                "--pin",
+                "Nuevo PIN / Passphrase de la bóveda (mín. 4 caracteres): ",
+                false,
+            )?;
+
             let secret = AdminSecret {
                 github_username: github_user,
-                admin_pat,
-                worker_pat_or_app_token: worker_token,
+                admin_pat: resolved_admin_pat,
+                worker_pat_or_app_token: resolved_worker_token,
             };
-            vault.seal_vault(&secret, &pin, os_bio, None)?;
+            let seal_res = vault.seal_vault(&secret, &resolved_pin, os_bio, None);
+            resolved_pin.zeroize();
+            drop(secret);
+            seal_res?;
             println!("✅ Bóveda Admin sellada con AES-256-GCM + Argon2id en {}", vault.vault_path().display());
         }
         Commands::Init {
@@ -293,18 +488,30 @@ async fn main() -> Result<()> {
         } => {
             let wcfg = vault.load_worker_config();
             let ws_path = path.unwrap_or_else(|| {
-                let pub_base = PathBuf::from("/home/edu/git/pub");
-                if pub_base.is_dir() {
-                    pub_base.join(&name)
-                } else {
-                    std::env::current_dir().unwrap().join(&name)
+                if let Some(home) = dirs::home_dir() {
+                    let pub_base = home.join("git").join("pub");
+                    if pub_base.is_dir() {
+                        return pub_base.join(&name);
+                    }
                 }
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(&name)
             });
 
             let secret_opt = if bio {
                 Some(vault.unseal_with_os_biometrics(&format!("gitOlorin: Crear repo {}", name))?)
-            } else if let Some(p) = pin {
-                Some(vault.unseal_with_pin(&p)?)
+            } else if let Some(p_opt) = pin {
+                let mut p = resolve_cli_secret(
+                    Some(p_opt),
+                    "GITOLORIN_VAULT_PIN",
+                    "--pin",
+                    "PIN de bóveda: ",
+                    false,
+                )?;
+                let res = vault.unseal_with_pin(&p);
+                p.zeroize();
+                Some(res?)
             } else {
                 None
             };
@@ -382,6 +589,17 @@ async fn main() -> Result<()> {
                 }
             );
             println!("   Repositorios gobernados: {}", db.repos.len());
+            if v_status["legacy_insecure_bio_key"].as_bool().unwrap_or(false)
+                || v_status["legacy_plaintext_worker_token"]
+                    .as_bool()
+                    .unwrap_or(false)
+            {
+                let gh_user = v_status["github_username"].as_str().unwrap_or("<usuario>");
+                println!(
+                    "   ⚠️  SEGURIDAD: Se detectaron archivos heredados sin aislamiento (.bio_seal.key o worker_token en texto plano).\n      Re-sella tu bóveda con `gitolorin setup-vault --github-user {} --os-bio` o desde la Web UI para migrarlos y eliminarlos.",
+                    gh_user
+                );
+            }
             println!("\n📋 COLA DE PENDIENTES:");
             let pending: Vec<_> = db
                 .queue
@@ -418,11 +636,20 @@ async fn main() -> Result<()> {
         Commands::Approve { bio, pin, all } => {
             let secret = if bio {
                 vault.unseal_with_os_biometrics("gitOlorin: Aprobar lote de cola")?
-            } else if let Some(p) = pin {
-                vault.unseal_with_pin(&p)?
+            } else if let Some(p_opt) = pin {
+                let mut p = resolve_cli_secret(
+                    Some(p_opt),
+                    "GITOLORIN_VAULT_PIN",
+                    "--pin",
+                    "PIN de bóveda: ",
+                    false,
+                )?;
+                let res = vault.unseal_with_pin(&p);
+                p.zeroize();
+                res?
             } else {
                 return Err(anyhow::anyhow!(
-                    "Debes especificar --bio (Huella del sistema) o --pin <PIN> para desbloquear la bóveda."
+                    "Debes especificar --bio (Huella del sistema) o --pin (o GITOLORIN_VAULT_PIN) para desbloquear la bóveda."
                 ));
             };
 
@@ -590,8 +817,11 @@ fn install_desktop_entry() -> Result<()> {
         let icon_path = icon_dir.join("gitolorin.png");
         std::fs::write(&icon_path, include_bytes!("../static/icon-512.png"))?;
 
-        let exe_path = std::env::current_exe()
-            .unwrap_or_else(|_| PathBuf::from("/home/edu/.local/bin/gitolorin"));
+        let exe_path = std::env::current_exe().unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".local/bin/gitolorin")
+        });
         let desktop_path = apps_dir.join("gitolorin.desktop");
         let desktop_content = format!(
             "[Desktop Entry]\n\

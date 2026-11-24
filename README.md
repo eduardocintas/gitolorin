@@ -20,8 +20,9 @@ When working with AI coding agents (Claude Code, Antigravity, Cursor, Codex, Aid
 `gitOlorin` is a portable, single-binary Rust application (API server, Git Smart HTTP proxy, embedded Web UI, and native System Tray) that acts as the **single bastion between your AI agents and GitHub**:
 
 1. **Dual-Credential Model & Biometric Vault (`AES-256-GCM` + `Argon2id` + `Zeroize`):**
-   - **Worker Credential (Low Privilege — Optional):** The local proxy only uses it for clean *fast-forward* pushes to secondary feature branches (`feat/*`, `agent/*`).
-   - **Admin Vault (High Privilege):** Stored encrypted in `~/.gitolorin/admin.vault`. **Never decrypted in RAM while agents work.** It is only unsealed for a few seconds when you approve a batch using your **OS Fingerprint / Biometrics** (Linux `pkexec`/Polkit/`fprintd`, macOS Touch ID, Windows Hello) or Vault PIN, and wiped from memory immediately via `Zeroize`.
+   - **Worker Credential (Low Privilege — Optional):** Encrypted inside the Admin Vault (never stored in plaintext on disk) and cached strictly in RAM while the server runs for clean *fast-forward* pushes to secondary feature branches (`feat/*`, `agent/*`).
+   - **Admin Vault (High Privilege):** Stored encrypted in `~/.gitolorin/admin.vault` (`0600`). **Never decrypted in RAM while agents work.** The optional OS biometric unseal key is isolated outside the user's writable directory (Linux root-only `/etc/gitolorin/` via Polkit `pkexec`, macOS Keychain, Windows DPAPI) so local processes cannot unwrap it without OS authentication, and `AdminSecret` is wiped from memory immediately via `Zeroize`.
+   - **API & Transport Hardening:** Web UI API endpoints enforce `Host` allowlisting, `Origin` / `Sec-Fetch-Site` checks, and `HttpOnly; SameSite=Strict` session cookies; GitHub tokens are passed only via `stdin` (`curl --config -`) or host-scoped `GIT_CONFIG_*` environment variables (never in `argv` or shell history) and only to validated `https://github.com/` URLs.
 2. **Instant Local Staging (Zero Blocking):**
    - When an agent proactively requests a new repository (`gitolorin init my-repo`), `gitOlorin` immediately creates a local bare staging repository in `~/.gitolorin/staging/my-repo.git`, assigns a per-project local proxy token, and queues `CreateRepo` for your review.
    - The agent can commit, branch, and `git push` immediately without waiting for you—even offline.
@@ -43,8 +44,8 @@ gitolorin app
 # (Optional on Linux) Install application menu shortcut & icon
 gitolorin install-desktop
 
-# 2. Configure your encrypted Admin Vault (also available from the Web UI)
-gitolorin setup-vault --github-user <your-user> --admin-pat <ghp_xxx> --pin <PIN> --os-bio
+# 2. Configure your encrypted Admin Vault (prompts securely without exposing secrets in shell history)
+gitolorin setup-vault --github-user <your-user> --os-bio
 
 # 3. Initialize a repository (Agent / Local Staging mode + Jujutsu in AGENTS.md)
 gitolorin init my-project --vcs jj
