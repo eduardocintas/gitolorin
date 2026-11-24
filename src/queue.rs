@@ -4,7 +4,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -122,10 +122,43 @@ pub struct StateDbData {
     pub audit_log: Vec<AuditLogEntry>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DiskStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+fn file_stamp(path: &Path) -> Option<DiskStamp> {
+    let meta = fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(DiskStamp {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+            ino: meta.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Some(DiskStamp {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+        })
+    }
+}
+
+struct StoreInner {
+    data: StateDbData,
+    last_stamp: Option<DiskStamp>,
+}
+
 pub struct StateStore {
     pub db_path: PathBuf,
     pub staging_dir: PathBuf,
-    inner: Mutex<StateDbData>,
+    inner: Mutex<StoreInner>,
 }
 
 impl StateStore {
@@ -136,58 +169,82 @@ impl StateStore {
         fs::create_dir_all(&staging_dir)?;
         set_dir_0700(&staging_dir);
         let db_path = base_dir.join("state_db.json");
-        let data = if db_path.is_file() {
+        let (data, last_stamp) = if db_path.is_file() {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600));
             }
             let raw = fs::read_to_string(&db_path).unwrap_or_default();
-            serde_json::from_str(&raw).unwrap_or_default()
+            let parsed = serde_json::from_str(&raw).unwrap_or_default();
+            (parsed, file_stamp(&db_path))
         } else {
-            StateDbData {
-                next_queue_id: 1,
-                next_audit_id: 1,
-                ..Default::default()
-            }
+            (
+                StateDbData {
+                    next_queue_id: 1,
+                    next_audit_id: 1,
+                    ..Default::default()
+                },
+                None,
+            )
         };
         Ok(Self {
             db_path,
             staging_dir,
-            inner: Mutex::new(data),
+            inner: Mutex::new(StoreInner { data, last_stamp }),
         })
     }
 
-    fn save_locked(&self, data: &StateDbData) -> Result<()> {
+    fn reload_if_changed_locked(&self, guard: &mut StoreInner) {
+        let current = file_stamp(&self.db_path);
+        if current != guard.last_stamp {
+            if let Some(stamp) = current {
+                if let Ok(raw) = fs::read_to_string(&self.db_path) {
+                    if let Ok(parsed) = serde_json::from_str::<StateDbData>(&raw) {
+                        guard.data = parsed;
+                        guard.last_stamp = Some(stamp);
+                    }
+                }
+            }
+        }
+    }
+
+    fn save_locked(&self, guard: &mut StoreInner) -> Result<()> {
         let tmp = self.db_path.with_extension("json.tmp");
-        let raw = serde_json::to_string_pretty(data)?;
+        let raw = serde_json::to_string_pretty(&guard.data)?;
         write_file_0600(&tmp, raw.as_bytes())?;
         fs::rename(&tmp, &self.db_path)?;
+        guard.last_stamp = file_stamp(&self.db_path);
         Ok(())
     }
 
     pub fn snapshot(&self) -> StateDbData {
-        self.inner.lock().unwrap().clone()
+        let mut guard = self.inner.lock().unwrap();
+        self.reload_if_changed_locked(&mut guard);
+        guard.data.clone()
     }
 
     pub fn upsert_repo(&self, repo: ManagedRepo) -> Result<()> {
         let mut guard = self.inner.lock().unwrap();
-        guard.repos.insert(repo.name.clone(), repo);
-        self.save_locked(&guard)
+        self.reload_if_changed_locked(&mut guard);
+        guard.data.repos.insert(repo.name.clone(), repo);
+        self.save_locked(&mut guard)
     }
 
     pub fn get_repo(&self, name: &str) -> Option<ManagedRepo> {
-        let guard = self.inner.lock().unwrap();
-        guard.repos.get(name).cloned()
+        let mut guard = self.inner.lock().unwrap();
+        self.reload_if_changed_locked(&mut guard);
+        guard.data.repos.get(name).cloned()
     }
 
     pub fn mark_repo_synced(&self, name: &str, github_url: String) -> Result<()> {
         let mut guard = self.inner.lock().unwrap();
-        if let Some(r) = guard.repos.get_mut(name) {
+        self.reload_if_changed_locked(&mut guard);
+        if let Some(r) = guard.data.repos.get_mut(name) {
             r.github_synced = true;
             r.github_url = Some(github_url);
         }
-        self.save_locked(&guard)
+        self.save_locked(&mut guard)
     }
 
     pub fn enqueue_item(
@@ -205,11 +262,12 @@ impl StateStore {
         diff_summary: String,
     ) -> Result<QueueItem> {
         let mut guard = self.inner.lock().unwrap();
-        if guard.next_queue_id == 0 {
-            guard.next_queue_id = 1;
+        self.reload_if_changed_locked(&mut guard);
+        if guard.data.next_queue_id == 0 {
+            guard.data.next_queue_id = 1;
         }
-        let id = guard.next_queue_id;
-        guard.next_queue_id += 1;
+        let id = guard.data.next_queue_id;
+        guard.data.next_queue_id += 1;
 
         let item = QueueItem {
             id,
@@ -229,8 +287,8 @@ impl StateStore {
             resolved_at: None,
             error_message: None,
         };
-        guard.queue.push(item.clone());
-        self.save_locked(&guard)?;
+        guard.data.queue.push(item.clone());
+        self.save_locked(&mut guard)?;
         Ok(item)
     }
 
@@ -241,8 +299,9 @@ impl StateStore {
         err_msg: Option<String>,
     ) -> Result<Option<QueueItem>> {
         let mut guard = self.inner.lock().unwrap();
+        self.reload_if_changed_locked(&mut guard);
         let mut found = None;
-        for item in guard.queue.iter_mut() {
+        for item in guard.data.queue.iter_mut() {
             if item.id == id {
                 item.status = status.clone();
                 if matches!(
@@ -256,7 +315,7 @@ impl StateStore {
                 break;
             }
         }
-        self.save_locked(&guard)?;
+        self.save_locked(&mut guard)?;
         Ok(found)
     }
 
@@ -269,12 +328,13 @@ impl StateStore {
         details: &str,
     ) {
         let mut guard = self.inner.lock().unwrap();
-        if guard.next_audit_id == 0 {
-            guard.next_audit_id = 1;
+        self.reload_if_changed_locked(&mut guard);
+        if guard.data.next_audit_id == 0 {
+            guard.data.next_audit_id = 1;
         }
-        let id = guard.next_audit_id;
-        guard.next_audit_id += 1;
-        guard.audit_log.insert(
+        let id = guard.data.next_audit_id;
+        guard.data.next_audit_id += 1;
+        guard.data.audit_log.insert(
             0,
             AuditLogEntry {
                 id,
@@ -286,10 +346,10 @@ impl StateStore {
                 details: details.to_string(),
             },
         );
-        if guard.audit_log.len() > 250 {
-            guard.audit_log.truncate(250);
+        if guard.data.audit_log.len() > 250 {
+            guard.data.audit_log.truncate(250);
         }
-        let _ = self.save_locked(&guard);
+        let _ = self.save_locked(&mut guard);
     }
 }
 
@@ -353,6 +413,65 @@ mod tests {
             assert_eq!(staging_mode, 0o700);
             assert_eq!(db_mode, 0o600);
         }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_cross_process_reload_preserves_cli_enqueued_items() {
+        let base = temp_store_dir("cross_proc");
+        let daemon_store = StateStore::new(base.clone()).unwrap();
+
+        // Daemon enqueues item #1
+        let item1 = daemon_store
+            .enqueue_item(
+                QueueItemKind::MergeRequest,
+                "repo-a".to_string(),
+                "MR 1".to_string(),
+                "desc 1".to_string(),
+                "feat/one".to_string(),
+                "main".to_string(),
+                "0000".to_string(),
+                "HEAD".to_string(),
+                true,
+                "jj".to_string(),
+                "diff 1".to_string(),
+            )
+            .unwrap();
+
+        // Separate CLI process opens StateStore and enqueues item #2
+        let cli_store = StateStore::new(base.clone()).unwrap();
+        let item2 = cli_store
+            .enqueue_item(
+                QueueItemKind::MergeRequest,
+                "repo-b".to_string(),
+                "MR 2 from CLI".to_string(),
+                "desc 2".to_string(),
+                "feat/two".to_string(),
+                "main".to_string(),
+                "0000".to_string(),
+                "HEAD".to_string(),
+                true,
+                "jj".to_string(),
+                "diff 2".to_string(),
+            )
+            .unwrap();
+        assert_eq!(item2.id, 2);
+
+        // Daemon must see item #2 on snapshot()
+        let snap = daemon_store.snapshot();
+        assert_eq!(snap.queue.len(), 2);
+        assert!(snap.queue.iter().any(|q| q.id == item2.id && q.title == "MR 2 from CLI"));
+
+        // Daemon updates item #1 status; item #2 must NOT be overwritten/lost
+        daemon_store
+            .set_item_status(item1.id, QueueItemStatus::Executed, None)
+            .unwrap();
+
+        let cli_snap = cli_store.snapshot();
+        assert_eq!(cli_snap.queue.len(), 2);
+        assert_eq!(cli_snap.queue[0].status, QueueItemStatus::Executed);
+        assert_eq!(cli_snap.queue[1].status, QueueItemStatus::Pending);
 
         let _ = fs::remove_dir_all(&base);
     }
